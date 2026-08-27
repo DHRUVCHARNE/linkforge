@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────
+# Rust / Cargo
+# ─────────────────────────────────────────────
+# Compiled output and build artifacts
+/target/
+**/*.rs.bk          # rustfmt backup files
+*.pdb               # debug symbols (Windows)
+
+# NOTE: Cargo.lock is intentionally NOT ignored.
+# LinkForge is a binary/application, so COMMIT Cargo.lock
+# for reproducible builds. (Libraries would ignore it.)
+
+# ─────────────────────────────────────────────
+# Secrets & environment
+# ─────────────────────────────────────────────
+.env                # local secrets — NEVER commit
+.env.*.local
+*.local
+
+# Keep the committed template:
+!.env.example
+
+# ─────────────────────────────────────────────
+# sqlx
+# ─────────────────────────────────────────────
+# Local SQLite dev DB (if used before Postgres migration)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# NOTE: the .sqlx/ directory (offline query cache) SHOULD be
+# committed so CI can build without a live database.
+# So we do NOT ignore it.
+
+# ─────────────────────────────────────────────
+# Docker / Postgres
+# ─────────────────────────────────────────────
+# Local volume data if you ever bind-mount instead of using named volumes
+/pgdata/
+/redisdata/
+docker-compose.override.yml   # personal local overrides
+
+# ─────────────────────────────────────────────
+# Observability / runtime output
+# ─────────────────────────────────────────────
+*.log
+/logs/
+/tmp/
+
+# Benchmark & profiling output
+/criterion/
+*.perf
+flamegraph.svg
+perf.data*
+
+# ─────────────────────────────────────────────
+# Editors & IDEs
+# ─────────────────────────────────────────────
+/.idea/             # JetBrains (RustRover, CLion)
+/.vscode/           # VS Code — or keep shared settings (see note below)
+*.iml
+*.swp
+*.swo
+*~
+
+# ─────────────────────────────────────────────
+# OS files
+# ─────────────────────────────────────────────
+.DS_Store           # macOS
+Thumbs.db           # Windows
+desktop.ini
