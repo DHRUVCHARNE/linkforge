@@ -70,7 +70,6 @@ pub enum Environment {
     Production,
 }
 
-
 // ── Defaults (used when a var is absent) ─────────────────────
 fn default_host() -> String {
     "0.0.0.0".into()
