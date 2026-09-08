@@ -19,7 +19,6 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "short code not found"),
             AppError::InvalidUrl => (StatusCode::BAD_REQUEST, "invalid_url"),
             AppError::Internal(e) => {
-                /// Log the cause , never leak internals to the client
                 tracing::error!(error=?e,"internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_server_error")
             }
