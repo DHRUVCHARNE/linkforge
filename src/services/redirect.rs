@@ -11,7 +11,7 @@ impl RedirectService {
     pub fn new(shortener: Arc<ShortenerService>) -> Self {
         Self { shortener }
     }
-    pub fn resolve(&self, raw_code: &str) -> Result<String, AppError> {
+    pub fn resolve(&self, raw_code: &str) -> Result<Arc<str>, AppError> {
         // untrusted input from the URL path -> validate through the domain
         let code = ShortCode::parse(raw_code).map_err(|_| AppError::NotFound)?;
         self.shortener.lookup(&code)?.ok_or(AppError::NotFound)

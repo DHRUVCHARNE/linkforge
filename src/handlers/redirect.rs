@@ -13,5 +13,5 @@ pub async fn redirect(
     let target = st.redirect.resolve(&code)?;
     //302 Found: browsers won't cache the mapping (better while iterating)
     // Switch to Redirect::permanent(308) once codes are truly immutable
-    Ok(Redirect::to(&target))
+    Ok(Redirect::temporary(&target))
 }

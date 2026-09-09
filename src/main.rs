@@ -1,7 +1,7 @@
 use linkforge::config;
 use tokio::net::TcpListener;
 
-#[tokio::main]
+#[tokio::main(flavor="multi_thread",worker_threads=2)]
 async fn main() -> anyhow::Result<()> {
     let settings = config::load()?;
     let state = linkforge::app::state::AppState::build(&settings);

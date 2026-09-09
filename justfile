@@ -6,6 +6,9 @@
 # Load variables from .env (DATABASE_URL, etc.) into every recipe
 set dotenv-load
 
+# Benchmark
+bench:
+     cargo bench
 # Show the list of available recipes when `just` is run bare
 default:
     @just --list
