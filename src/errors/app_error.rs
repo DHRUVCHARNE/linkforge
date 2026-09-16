@@ -6,6 +6,8 @@ use axum::{
 use serde_json::json;
 use tracing;
 
+use crate::repositories::RepoError;
+
 #[derive(Debug)]
 pub enum AppError {
     NotFound,
@@ -24,5 +26,14 @@ impl IntoResponse for AppError {
             }
         };
         (status, Json(json!({"error":message}))).into_response()
+    }
+}
+
+impl From<RepoError> for AppError {
+    fn from(e: RepoError) -> Self {
+        match e {
+            RepoError::Duplicate => AppError::Internal(anyhow::anyhow!("code collision")),
+            RepoError::Database(e) => AppError::Internal(e.into()),
+        }
     }
 }

@@ -4,12 +4,14 @@
 # ─────────────────────────────────────────────────────────────
 
 # Load variables from .env (DATABASE_URL, etc.) into every recipe
-set dotenv-load
+set dotenv-load:=true
 
 # Benchmark
 bench:
-     cargo bench
+     cargo bench --bench redirect_bench -- --save-baseline phase2
 # Show the list of available recipes when `just` is run bare
+bench-compare:
+      cargo bench --bench redirect_bench -- --baseline phase2
 default:
     @just --list
 
@@ -115,4 +117,6 @@ dev: up
 
 # Load test (Phase 3 harness)
 load-test:
+    just down 
+    just up
     ./scripts/load_test.sh

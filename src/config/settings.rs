@@ -1,17 +1,19 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+
 /// Top-level application configuration
 /// Built once at startup by `config::load()`, then treated as read-only
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Settings {
     pub server: ServerConfig,
-    pub database: DatabaseConfig,
+    pub database: DatabaseSettings,
     pub redis: RedisConfig,
     pub rate_limit: RateLimitConfig,
     pub auth: AuthConfig,
     pub env: Environment,
+    pub cache:CacheConfig
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,17 +25,34 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct DatabaseConfig {
+pub struct DatabaseSettings {
     pub url: String,
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     #[serde(default = "default_acquire_timeout_secs")]
     pub acquire_timeout_secs: u64,
+    pub idle_timeout_secs: u64,
+    
 }
 
-impl DatabaseConfig {
+impl DatabaseSettings {
     pub fn acquire_timeout(&self) -> Duration {
         Duration::from_secs(self.acquire_timeout_secs)
+    }
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
+    }
+}
+
+#[derive(Debug,Clone,Deserialize)]
+pub struct CacheConfig {
+    #[serde(default="default_negative_ttl_secs")]
+    pub negative_ttl_secs:u64,
+}
+
+impl CacheConfig {
+    pub fn negative_ttl(&self) -> Duration {
+        Duration::from_secs(self.negative_ttl_secs)
     }
 }
 
@@ -56,16 +75,17 @@ impl RateLimitConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     pub jwt_secret: String,
     #[serde(default = "default_jwt_expiry_secs")]
     pub jwt_expiry_secs: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Environment {
+    #[default]
     Development,
     Production,
 }
@@ -97,4 +117,17 @@ fn default_rate_window_secs() -> u64 {
 
 fn default_jwt_expiry_secs() -> u64 {
     3600
+}
+
+fn default_negative_ttl_secs() -> u64 {
+    30
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("jwt_secret", &"<redacted>")
+            .field("jwt_expiry_secs", &self.jwt_expiry_secs)
+            .finish()
+    }
 }

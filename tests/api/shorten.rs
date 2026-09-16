@@ -21,10 +21,7 @@ async fn shorten_valid_url_returns_200_with_code() {
 
     let body: CreateLinkResponse = resp.json().await.expect("body was not valid JSON");
     assert!(!body.code.is_empty(), "code must not be empty");
-    assert!(
-        body.short_url.ends_with(&body.code),
-        "short_url should end with the generated code"
-    );
+    assert!(body.short_url.ends_with(&body.code), "short_url should end with the generated code");
 }
 
 #[tokio::test]
@@ -51,18 +48,10 @@ async fn shorten_rejects_garbage_input() {
 async fn two_shortens_produce_distinct_codes() {
     let app = TestApp::spawn().await;
 
-    let a: CreateLinkResponse = app
-        .post_shorten("https://example.com/a")
-        .await
-        .json()
-        .await
-        .expect("json a");
-    let b: CreateLinkResponse = app
-        .post_shorten("https://example.com/b")
-        .await
-        .json()
-        .await
-        .expect("json b");
+    let a: CreateLinkResponse =
+        app.post_shorten("https://example.com/a").await.json().await.expect("json a");
+    let b: CreateLinkResponse =
+        app.post_shorten("https://example.com/b").await.json().await.expect("json b");
 
     assert_ne!(a.code, b.code, "sequential shortens must yield unique codes");
 }

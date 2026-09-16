@@ -14,10 +14,11 @@ pub fn load() -> anyhow::Result<Settings> {
             host: env_or("APP_HOST", "0.0.0.0"),
             port: env_parse("APP_PORT", 3000)?,
         },
-        database: DatabaseConfig {
+        database: DatabaseSettings {
             url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
             max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 20)?,
             acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 3)?,
+            idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 3)?,
         },
         redis: RedisConfig { url: env_or("REDIS_URL", "redis://localhost:6379") },
         rate_limit: RateLimitConfig {
@@ -32,6 +33,7 @@ pub fn load() -> anyhow::Result<Settings> {
             Ok("production") => Environment::Production,
             _ => Environment::Development,
         },
+        cache:CacheConfig { negative_ttl_secs: env_parse("CACHE_NEGATIVE_TTL",30)? }
     })
 }
 

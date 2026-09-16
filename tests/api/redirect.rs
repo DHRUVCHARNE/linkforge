@@ -19,21 +19,13 @@ async fn known_code_redirects_to_target() {
     let target = "https://www.rust-lang.org/";
 
     // create a link first
-    let created: CreateLinkResponse = app
-        .post_shorten(target)
-        .await
-        .json()
-        .await
-        .expect("shorten response json");
+    let created: CreateLinkResponse =
+        app.post_shorten(target).await.json().await.expect("shorten response json");
 
     // follow it (client does NOT auto-follow — we inspect the redirect itself)
     let resp = app.get_code(&created.code).await;
 
-    assert!(
-        resp.status().is_redirection(),
-        "expected a 3xx redirect, got {}",
-        resp.status()
-    );
+    assert!(resp.status().is_redirection(), "expected a 3xx redirect, got {}", resp.status());
 
     let location = resp
         .headers()
@@ -58,20 +50,13 @@ async fn full_round_trip_shorten_then_redirect() {
     let app = TestApp::spawn().await;
     let target = "https://tokio.rs/";
 
-    let created: CreateLinkResponse = app
-        .post_shorten(target)
-        .await
-        .json()
-        .await
-        .expect("shorten json");
+    let created: CreateLinkResponse =
+        app.post_shorten(target).await.json().await.expect("shorten json");
 
     let redirect = app.get_code(&created.code).await;
     assert!(redirect.status().is_redirection());
     assert_eq!(
-        redirect
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|h| h.to_str().ok()),
+        redirect.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()),
         Some(target)
     );
 }

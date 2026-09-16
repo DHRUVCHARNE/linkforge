@@ -16,21 +16,15 @@ async fn same_code_resolves_repeatedly() {
     let app = TestApp::spawn().await;
     let target = "https://doc.rust-lang.org/book/";
 
-    let created: CreateLinkResponse = app
-        .post_shorten(target)
-        .await
-        .json()
-        .await
-        .expect("shorten json");
+    let created: CreateLinkResponse =
+        app.post_shorten(target).await.json().await.expect("shorten json");
 
     // Hammer the read path a few times; every read must resolve identically.
     for _ in 0..25 {
         let resp = app.get_code(&created.code).await;
         assert!(resp.status().is_redirection());
         assert_eq!(
-            resp.headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|h| h.to_str().ok()),
+            resp.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()),
             Some(target)
         );
     }
@@ -40,18 +34,10 @@ async fn same_code_resolves_repeatedly() {
 async fn distinct_urls_get_distinct_codes_and_resolve_independently() {
     let app = TestApp::spawn().await;
 
-    let first: CreateLinkResponse = app
-        .post_shorten("https://a.example/")
-        .await
-        .json()
-        .await
-        .expect("json a");
-    let second: CreateLinkResponse = app
-        .post_shorten("https://b.example/")
-        .await
-        .json()
-        .await
-        .expect("json b");
+    let first: CreateLinkResponse =
+        app.post_shorten("https://a.example/").await.json().await.expect("json a");
+    let second: CreateLinkResponse =
+        app.post_shorten("https://b.example/").await.json().await.expect("json b");
 
     assert_ne!(first.code, second.code);
 
@@ -59,15 +45,11 @@ async fn distinct_urls_get_distinct_codes_and_resolve_independently() {
     let r2 = app.get_code(&second.code).await;
 
     assert_eq!(
-        r1.headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|h| h.to_str().ok()),
+        r1.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()),
         Some("https://a.example/")
     );
     assert_eq!(
-        r2.headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|h| h.to_str().ok()),
+        r2.headers().get(reqwest::header::LOCATION).and_then(|h| h.to_str().ok()),
         Some("https://b.example/")
     );
 }
