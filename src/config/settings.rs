@@ -1,7 +1,6 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-
 /// Top-level application configuration
 /// Built once at startup by `config::load()`, then treated as read-only
 
@@ -13,7 +12,7 @@ pub struct Settings {
     pub rate_limit: RateLimitConfig,
     pub auth: AuthConfig,
     pub env: Environment,
-    pub cache:CacheConfig
+    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -32,7 +31,6 @@ pub struct DatabaseSettings {
     #[serde(default = "default_acquire_timeout_secs")]
     pub acquire_timeout_secs: u64,
     pub idle_timeout_secs: u64,
-    
 }
 
 impl DatabaseSettings {
@@ -44,10 +42,10 @@ impl DatabaseSettings {
     }
 }
 
-#[derive(Debug,Clone,Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    #[serde(default="default_negative_ttl_secs")]
-    pub negative_ttl_secs:u64,
+    #[serde(default = "default_negative_ttl_secs")]
+    pub negative_ttl_secs: u64,
 }
 
 impl CacheConfig {

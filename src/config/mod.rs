@@ -33,7 +33,7 @@ pub fn load() -> anyhow::Result<Settings> {
             Ok("production") => Environment::Production,
             _ => Environment::Development,
         },
-        cache:CacheConfig { negative_ttl_secs: env_parse("CACHE_NEGATIVE_TTL",30)? }
+        cache: CacheConfig { negative_ttl_secs: env_parse("CACHE_NEGATIVE_TTL", 30)? },
     })
 }
 

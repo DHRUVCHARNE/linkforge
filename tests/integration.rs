@@ -6,5 +6,5 @@ mod concurrency;
 #[path = "integration/flow.rs"]
 mod flow;
 
-#[path="integration/cache_coherence.rs"]
+#[path = "integration/cache_coherence.rs"]
 mod cache_coherence;

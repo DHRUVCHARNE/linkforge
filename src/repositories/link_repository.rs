@@ -8,14 +8,13 @@ use crate::domain::{link::Link, short_code::ShortCode};
 
 pub struct SqlxLinkRepository {
     pool: PgPool,
-    queries:AtomicU64
+    queries: AtomicU64,
 }
 
 impl SqlxLinkRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool,queries:AtomicU64::new(0) }
+        Self { pool, queries: AtomicU64::new(0) }
     }
-   
 }
 
 #[async_trait]
@@ -37,7 +36,7 @@ impl LinkRepository for SqlxLinkRepository {
         }
     }
     async fn find_by_code(&self, code: &ShortCode) -> Result<Option<Link>, RepoError> {
-        self.queries.fetch_add(1,Ordering::Relaxed);
+        self.queries.fetch_add(1, Ordering::Relaxed);
         let row = sqlx::query!("SELECT code, url FROM links WHERE code = $1", code.as_str())
             .fetch_optional(&self.pool)
             .await?;
@@ -45,5 +44,5 @@ impl LinkRepository for SqlxLinkRepository {
     }
     fn query_count(&self) -> u64 {
         self.queries.load(Ordering::Relaxed)
-    } 
+    }
 }

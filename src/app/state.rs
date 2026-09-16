@@ -1,6 +1,5 @@
 use crate::cache::{Cache, InMemoryCache};
 use crate::config::{Environment, Settings};
-use crate::domain::link;
 use crate::repositories::LinkRepository;
 use crate::repositories::link_repository::SqlxLinkRepository;
 use crate::services::{redirect::RedirectService, shortener::ShortenerService};
@@ -12,7 +11,7 @@ pub struct AppState {
     pub redirect: Arc<RedirectService>,
     pub base_url: Arc<str>,
     pub cache: Arc<dyn Cache>,
-    pub links:Arc<dyn LinkRepository>,
+    pub links: Arc<dyn LinkRepository>,
     pub debug_routes: bool,
 }
 
@@ -37,7 +36,7 @@ impl AppState {
             shortener,
             redirect,
             base_url,
-            links:Arc::clone(&links),
+            links: Arc::clone(&links),
             cache: Arc::clone(&cache),
             debug_routes: settings.env == Environment::Development,
         })

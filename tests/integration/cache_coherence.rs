@@ -1,22 +1,20 @@
 // tests/integration/cache_coherence.rs
 use crate::common::TestApp;
-use linkforge::cache::Cache;
 use linkforge::domain::short_code::ShortCode;
 use linkforge::utils::base62;
 
 #[derive(serde::Deserialize)]
 struct CreateLinkResponse {
-code:String,
-#[allow(dead_code)]
-short_url:String,
+    code: String,
+    #[allow(dead_code)]
+    short_url: String,
 }
 #[tokio::test]
 async fn invalidate_forces_a_reread_from_the_database() {
     let app = TestApp::spawn().await;
     let target = "https://www.rust-lang.org/";
 
-    let created: CreateLinkResponse = app
-        .post_shorten(target).await.json().await.expect("json");
+    let created: CreateLinkResponse = app.post_shorten(target).await.json().await.expect("json");
 
     // Delete the row behind the service's back. The cache still serves it.
     app.delete_link_row(&created.code).await;
@@ -48,12 +46,8 @@ async fn creating_a_code_clears_its_negative_entry() {
 
     // Create a link — it should land on that code and OVERWRITE the negative
     // entry via the write-through in ShortenerService::create.
-    let created: CreateLinkResponse = app
-        .post_shorten("https://www.rust-lang.org/")
-        .await
-        .json()
-        .await
-        .expect("json");
+    let created: CreateLinkResponse =
+        app.post_shorten("https://www.rust-lang.org/").await.json().await.expect("json");
 
     assert_eq!(created.code, next_code, "test assumption broken: counter did not start at 1");
 

@@ -55,7 +55,7 @@ fn with_db_name(url: &str, db: &str) -> String {
         None => format!("{url}/{db}"),
     }
 }
-
+#[allow(dead_code)]
 /// A running LinkForge instance, its isolated database, and a client.
 pub struct TestApp {
     /// e.g. "http://127.0.0.1:54123" — no trailing slash.
@@ -67,44 +67,42 @@ pub struct TestApp {
     pub pool: PgPool,
     /// Name of the throwaway database, kept for teardown.
     db_name: String,
-    pub cache:Arc<dyn Cache>
+    pub cache: Arc<dyn Cache>,
 }
-
+#[allow(dead_code)]
 impl TestApp {
     /// Boot a fresh server backed by a brand-new, migrated database.
     pub async fn spawn() -> Self {
-    let db_name = format!("linkforge_test_{}", Uuid::new_v4().simple());
-    let admin_url = base_url();
+        let db_name = format!("linkforge_test_{}", Uuid::new_v4().simple());
+        let admin_url = base_url();
 
-    // --- 1. Create an isolated database for this test ---
-    let query = Box::leak(format!(r#"CREATE DATABASE "{db_name}""#).into_boxed_str()) as &str;
-    let mut conn = PgConnection::connect(&admin_url)
-        .await
-        .expect("failed to connect to Postgres — is `just up` running?");
-    conn.execute(query)
-        .await
-        .expect("failed to create test database");
+        // --- 1. Create an isolated database for this test ---
+        let query = Box::leak(format!(r#"CREATE DATABASE "{db_name}""#).into_boxed_str()) as &str;
+        let mut conn = PgConnection::connect(&admin_url)
+            .await
+            .expect("failed to connect to Postgres — is `just up` running?");
+        conn.execute(query).await.expect("failed to create test database");
 
-    let db_url = with_db_name(&admin_url, &db_name);
+        let db_url = with_db_name(&admin_url, &db_name);
 
-    // --- 2. Connect + migrate ---
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .expect("failed to connect to test database");
+        // --- 2. Connect + migrate ---
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .expect("failed to connect to test database");
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("failed to run migrations on test database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("failed to run migrations on test database");
 
-    // --- 3. Boot the server; take ITS cache so invalidation targets the
-    //        same Arc the services are using.
-    let (address, client, cache) = spawn_server(pool.clone()).await;
+        // --- 3. Boot the server; take ITS cache so invalidation targets the
+        //        same Arc the services are using.
+        let (address, client, cache) = spawn_server(pool.clone()).await;
 
-    Self { address, client, pool, db_name, cache }
-}
+        Self { address, client, pool, db_name, cache }
+    }
 
     /// Boot a SECOND server against the same database with a **cold cache**.
     ///
@@ -112,7 +110,7 @@ impl TestApp {
     /// link that still resolves must have come from Postgres. Proving M2
     /// ("it remembers") without actually killing a process.
     pub async fn restart(&self) -> RestartedApp {
-        let (address, client,cache) = spawn_server(self.pool.clone()).await;
+        let (address, client, _) = spawn_server(self.pool.clone()).await;
         RestartedApp { address, client }
     }
 
@@ -171,13 +169,13 @@ impl TestApp {
         self.cache.invalidate(&c).await;
     }
 }
-
+#[allow(dead_code)]
 /// A second server instance sharing a database — see `TestApp::restart`.
 pub struct RestartedApp {
     pub address: String,
     pub client: reqwest::Client,
 }
-
+#[allow(dead_code)]
 impl RestartedApp {
     pub async fn get_code(&self, code: &str) -> reqwest::Response {
         self.client
@@ -193,7 +191,7 @@ impl RestartedApp {
 /// NOTE: this mirrors `AppState::build` but takes a pool directly, so tests
 /// never depend on config/env loading. If your `AppState` gains fields, add
 /// them here too.
-async fn spawn_server(pool: PgPool) -> (String, reqwest::Client,Arc<dyn Cache>) {
+async fn spawn_server(pool: PgPool) -> (String, reqwest::Client, Arc<dyn Cache>) {
     // Resume the counter past the highest existing id, exactly as production
     // does — otherwise a restarted instance reissues codes that already exist.
     let start_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM links")
@@ -213,8 +211,14 @@ async fn spawn_server(pool: PgPool) -> (String, reqwest::Client,Arc<dyn Cache>) 
         .expect("failed to bind ephemeral test port");
     let addr: SocketAddr = listener.local_addr().expect("listener has no local addr");
 
-    let state =
-        AppState { shortener, redirect, base_url: Arc::from(format!("http://{addr}").as_str()),cache:cache.clone(),links:links.clone(),debug_routes:true };
+    let state = AppState {
+        shortener,
+        redirect,
+        base_url: Arc::from(format!("http://{addr}").as_str()),
+        cache: cache.clone(),
+        links: links.clone(),
+        debug_routes: true,
+    };
 
     let app = router::create(state);
     tokio::spawn(async move {
@@ -226,5 +230,5 @@ async fn spawn_server(pool: PgPool) -> (String, reqwest::Client,Arc<dyn Cache>) 
         .build()
         .expect("failed to build reqwest client");
 
-    (format!("http://{addr}"), client,Arc::clone(&cache))
+    (format!("http://{addr}"), client, Arc::clone(&cache))
 }

@@ -70,3 +70,4 @@ and coalescing cost the hot path nothing measurable.
 produced 8% write failures at c=100 (unique-index insert cost exceeding
 the 3s pool acquire_timeout). The load test must run against a fresh
 database to be comparable.
+## Phase 3: In Progress

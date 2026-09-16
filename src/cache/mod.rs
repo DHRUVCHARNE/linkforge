@@ -2,9 +2,12 @@ pub mod redis_cache;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use sqlx::encode::IsNull::No;
 use std::{
-    sync::{Arc, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use crate::domain::short_code::ShortCode;
@@ -62,15 +65,15 @@ pub struct CacheStats {
 
 impl CacheStats {
     pub fn total(&self) -> u64 {
-        self.hits+self.negative_hits + self.misses
+        self.hits + self.negative_hits + self.misses
     }
     // Fraction of lookups without touching the database
     pub fn hit_ratio(&self) -> f64 {
         let total = self.total();
-        if total==0 {
+        if total == 0 {
             return 0.0;
         }
-        (self.hits+self.negative_hits) as f64 / total as f64
+        (self.hits + self.negative_hits) as f64 / total as f64
     }
 }
 
@@ -80,9 +83,9 @@ impl Cache for InMemoryCache {
         //Clone out and drop the guard immedeately - never hold the dashmap
         // reference acroxx an await point.
         let entry = match self.map.get(code).map(|e| e.value().clone()) {
-            Some(e)=>e,
-            None=>{
-                self.misses.fetch_add(1,Ordering::Relaxed);
+            Some(e) => e,
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
@@ -90,18 +93,18 @@ impl Cache for InMemoryCache {
             && Instant::now() >= exp
         {
             self.map.remove(code);
-            self.misses.fetch_add(1,Ordering::Relaxed);
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return None; //lazy eviction
         }
         Some(match &entry.value {
-            Some(url) =>{
+            Some(url) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 Cached::Hit(url.clone())
-            },
-            None =>{
-                self.negative_hits.fetch_add(1,Ordering::Relaxed);
+            }
+            None => {
+                self.negative_hits.fetch_add(1, Ordering::Relaxed);
                 Cached::Missing
-            },
+            }
         })
     }
     async fn set(&self, code: ShortCode, url: Arc<str>) {
@@ -117,8 +120,10 @@ impl Cache for InMemoryCache {
         );
     }
     fn stats(&self) -> CacheStats {
-        CacheStats { hits: self.hits.load(Ordering::Relaxed),
-             negative_hits: self.negative_hits.load(Ordering::Relaxed),
-              misses: self.misses.load(Ordering::Relaxed) }
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            negative_hits: self.negative_hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
     }
 }
