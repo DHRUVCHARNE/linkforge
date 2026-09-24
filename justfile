@@ -19,7 +19,7 @@ default:
 
 # Run application
 run:
-    cargo run
+    cargo run --release
 
 # Run application with live-reload (needs cargo-watch)
 watch:

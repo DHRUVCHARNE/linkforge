@@ -25,7 +25,7 @@ pub fn create(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
                 .layer(trace_mw::layer())
-                .layer(RateLimitLayer::new(state.rate_limit.clone()))
+               .layer(RateLimitLayer::new(state.rate_limit.clone()))
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
         .with_state(state)

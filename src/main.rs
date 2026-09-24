@@ -4,7 +4,7 @@ use tokio::net::TcpListener;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let settings = config::load()?;
-    linkforge::observability::tracing::init(&settings);
+    let _guard = linkforge::observability::tracing::init(&settings);
     let state = linkforge::app::state::AppState::build(&settings).await?;
     let app = linkforge::app::router::create(state);
 

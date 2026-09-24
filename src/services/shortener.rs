@@ -5,7 +5,7 @@ use crate::domain::{link::Link, short_code::ShortCode};
 use crate::errors::app_error::AppError;
 use crate::repositories::LinkRepository;
 use crate::utils::base62;
-use std::net::{IpAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -73,9 +73,10 @@ impl ShortenerService {
         if host == "localhost" || host.ends_with(".localhost") {
             return Err(AppError::InvalidUrl);
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() && (ip.is_loopback() || ip.is_unspecified() || is_private(&ip)){
-                return Err(AppError::InvalidUrl);
-            
+        if let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && (ip.is_loopback() || ip.is_unspecified() || is_private(&ip))
+        {
+            return Err(AppError::InvalidUrl);
         }
         Ok(parsed.to_string())
     }

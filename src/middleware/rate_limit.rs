@@ -132,11 +132,11 @@ where
 fn extract_ip(req: &Request<Body>) -> IpAddr {
     #[cfg(feature = "trust_proxy_headers")]
     if let Some(fwd) = req.headers().get("x-forwarded-for")
-       && let Some(first) = fwd.to_str().ok().and_then(|s| s.split(',').next()) 
-           && let Ok(ip) = first.trim().parse::<IpAddr>() {
-                return ip;
-           
-         }
+        && let Some(first) = fwd.to_str().ok().and_then(|s| s.split(',').next())
+        && let Ok(ip) = first.trim().parse::<IpAddr>()
+    {
+        return ip;
+    }
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
@@ -158,7 +158,7 @@ mod tests {
     }
     #[test]
     fn refills_over_time() {
-        let mut b = Bucket::new(1.0 );
+        let mut b = Bucket::new(1.0);
         assert!(b.try_consume(1.0, 100.0));
         assert!(!b.try_consume(1.0, 100.0));
         std::thread::sleep(std::time::Duration::from_millis(50));
