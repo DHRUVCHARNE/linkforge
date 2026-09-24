@@ -14,3 +14,6 @@ mod cache;
 
 #[path = "phase2/db_restart.rs"]
 mod db;
+
+#[path = "api/rate_limit.rs"]
+mod rate_limit;

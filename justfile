@@ -119,4 +119,6 @@ dev: up
 load-test:
     just down 
     just up
+    LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
+    LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 \
     ./scripts/load_test.sh

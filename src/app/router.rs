@@ -1,10 +1,14 @@
 use crate::app::state::AppState;
 use crate::handlers::{debug, health, redirect, shorten};
+use crate::middleware::{
+    rate_limit::RateLimitLayer, request_id::MakeRequestUuid, tracing as trace_mw,
+};
 use axum::{
     Router,
     routing::{get, post},
 };
-
+use tower::ServiceBuilder;
+use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
 pub fn create(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/health", get(health::health))
@@ -15,5 +19,14 @@ pub fn create(state: AppState) -> Router {
             .route("/debug/cache", get(debug::cache_stats))
             .route("/debug/cache/invalidate/{code}", post(debug::invalidate))
     }
-    router.route("/{code}", get(redirect::redirect)).with_state(state)
+    router
+        .route("/{code}", get(redirect::redirect))
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(trace_mw::layer())
+                .layer(RateLimitLayer::new(state.rate_limit.clone()))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        )
+        .with_state(state)
 }

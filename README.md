@@ -70,4 +70,64 @@ and coalescing cost the hot path nothing measurable.
 produced 8% write failures at c=100 (unique-index insert cost exceeding
 the 3s pool acquire_timeout). The load test must run against a fresh
 database to be comparable.
-## Phase 3: In Progress
+## Baseline — Phase 3 (tracing + request IDs + per-IP rate limiting)
+
+Env: GitHub Codespaces, 2 vCPU · Postgres + Redis co-located · fresh database
+Hot read path `GET /:code`, oha 10s, keepalive on
+Server started in BENCH MODE (`RATE_LIMIT_REQUESTS=100000000`) so the
+limiter cannot throttle the benchmark.
+
+| c   | req/s | p50      | p99      |
+|-----|-------|----------|----------|
+| 100 | 5,404 | 17.15 ms | 47.32 ms |
+
+Correctness: 10,000 concurrent POSTs → 10,000 unique codes, 0 duplicates,
+0 failures (429: 0, 500: 0).
+
+### Phase 3 acceptance
+
+| Criterion | Result |
+|---|---|
+| Client `x-request-id` echoed unchanged | ✅ |
+| `x-request-id` generated when absent | ✅ (UUID v4) |
+| Generated IDs distinct across requests | ✅ |
+| Exceeding the rate returns 429 | ⚠️ verified separately — see below |
+| Logs correlate across middleware + handler | ⚠️ manual grep — see below |
+
+### Carried forward from Phase 2 (still passing)
+
+| Probe | Result |
+|---|---|
+| Negative caching | 501 requests, 1 nonexistent code → **1 DB query** |
+| Single-flight | 129 concurrent misses → **1 DB query** (129× coalescing) |
+| Hit ratio | 99.76% → expected ~1,298 ns/lookup |
+| Overall coalescing | 22.33 cache misses per DB query |
+
+### ⚠️ Throughput regression: 9,783 → 5,404 req/s (−45%)
+
+p50 rose 9.55 → 17.15 ms; p99 rose 25.13 → 47.32 ms. This is a real delta,
+far outside the ~2% run-to-run noise floor.
+
+**Cause not yet isolated.** Three candidates, untested:
+
+1. Per-request tracing spans (CPU cost of `TraceLayer` + subscriber)
+2. The rate limiter — all load originates from one IP, so every request
+   contends on a single `DashMap` shard: the pathological case for sharding
+3. Environment noise — `DNS+dialup` rose 4.5 → 13.87 ms, which is scheduler
+   contention, not application code
+
+To isolate, rerun with `RUST_LOG=off`, then with the `RateLimitLayer`
+removed, comparing each against this figure.
+
+⚠️ A previous phase attributed a similar one-off regression (9,763 → 5,539)
+to container CPU contention; it did not reproduce across two subsequent
+runs. **Do not accept this number from a single run.**
+
+### ⚠️ Benchmark methodology change
+
+From Phase 3 the server must be started in BENCH MODE or the rate limiter
+throttles the harness itself. An earlier run recorded 192/10,000 successful
+writes — 9,808 of them 429s — which under the Phase 2 script would have
+appeared as silent write failures and been misdiagnosed as pool timeouts.
+
+    RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 just run

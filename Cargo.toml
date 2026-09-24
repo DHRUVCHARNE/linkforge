@@ -17,6 +17,12 @@ chrono={version="0.4",features=["serde"]}
 async-trait="0.1"
 thiserror = "2.0.20"
 uuid = {version="1.26.1",features=["v4"]}
+tracing-subscriber={version="0.3", features=["env-filter","json"]}
+tower-http={version="0.6.11", features=["trace","request-id","timeout"]}
+tower = "0.5.3"
+futures-util = "0.3.34"
+reqwest = "0.12"
+
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
@@ -25,3 +31,7 @@ criterion="0.5"
 [[bench]]
 name="redirect_bench"
 harness=false
+
+[features]
+default=[]
+trust_proxy_headers=[]
