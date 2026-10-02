@@ -1,5 +1,5 @@
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::{Environment, Settings};
 
@@ -11,9 +11,8 @@ use crate::config::{Environment, Settings};
 pub fn init(settings: &Settings) -> WorkerGuard {
     // Default filter is quieter than before: tower_http=debug logged an event
     // per request/response, which is pure cost at ~9k req/s.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("linkforge=info,tower_http=warn,sqlx=warn,warn")
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("linkforge=info,tower_http=warn,sqlx=warn,warn"));
 
     // Non-blocking writer: log formatting + the write() syscall move off the
     // request's thread onto a background worker fed by a bounded channel.
@@ -25,23 +24,13 @@ pub fn init(settings: &Settings) -> WorkerGuard {
     match settings.env {
         // Production: JSON, machine-parseable, ready for a log aggregator.
         Environment::Production => registry
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_writer(writer),
-            )
+            .with(tracing_subscriber::fmt::layer().json().flatten_event(true).with_writer(writer))
             .init(),
 
         // Development: human-readable, span path visible. Still non-blocking
         // so dev and prod share one code path.
         Environment::Development => registry
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .pretty()
-                    .with_target(true)
-                    .with_writer(writer),
-            )
+            .with(tracing_subscriber::fmt::layer().pretty().with_target(true).with_writer(writer))
             .init(),
     }
 

@@ -8,7 +8,6 @@ use anyhow::Context;
 /// Reads `.env` (via dotenvy) then pulls typed values from the environment.
 pub fn load() -> anyhow::Result<Settings> {
     dotenvy::dotenv().ok(); // load .env if present; ignore if missing (prod uses real env)
-
     Ok(Settings {
         server: ServerConfig {
             host: env_or("APP_HOST", "0.0.0.0"),
@@ -24,6 +23,8 @@ pub fn load() -> anyhow::Result<Settings> {
         rate_limit: RateLimitConfig {
             requests: env_parse("RATE_LIMIT_REQUESTS", 100)?,
             window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60)?,
+            sweep_interval: env_parse("RATE_LIMIT_SWEEP_INTERVAL_SECS", 300)?,
+            idle_ttl: env_parse("RATE_LIMIT_IDLE_TTL_SECS", 3600)?,
         },
         auth: AuthConfig {
             jwt_secret: std::env::var("JWT_SECRET").context("JWT_SECRET must be set")?,
@@ -34,6 +35,16 @@ pub fn load() -> anyhow::Result<Settings> {
             _ => Environment::Development,
         },
         cache: CacheConfig { negative_ttl_secs: env_parse("CACHE_NEGATIVE_TTL", 30)? },
+        analytics: AnalyticsConfig {
+            channel_capacity: env_parse("ANALYTICS_CHANNEL_CAPACITY", 10000)?,
+            max_batch: env_parse("ANALYTICS_MAX_BATCH", 500)?,
+            batch_wait_ms: env_parse("ANALYTICS_BATCH_WAIT_MS", 50)?,
+            ip_salt: env_parse("ANALYTICS_IP_SALT", "VVUBUubiuUiubijbiuB".to_string())?,
+            click_mode: match std::env::var("CLICK_MODE").as_deref() {
+                Ok("sync") => ClickMode::Sync,
+                _ => ClickMode::Async,
+            },
+        },
     })
 }
 

@@ -3,7 +3,7 @@ pub mod link_repository;
 
 use async_trait::async_trait;
 
-use crate::domain::{link::Link, short_code::ShortCode};
+use crate::domain::{click::Click, link::Link, short_code::ShortCode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
@@ -20,4 +20,12 @@ pub trait LinkRepository: Send + Sync {
     fn query_count(&self) -> u64 {
         0
     }
+}
+
+#[async_trait]
+pub trait ClickRepository: Send + Sync + 'static {
+    /// Batched insert. the whole point of the worker is that
+    /// this is called once per BATCH, not once per redirect
+    async fn insert_batch(&self, clicks: &[Click]) -> Result<(), RepoError>;
+    async fn count_for(&self, code: &ShortCode) -> Result<i64, RepoError>;
 }

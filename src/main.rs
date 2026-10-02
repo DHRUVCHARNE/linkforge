@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use linkforge::config;
 use tokio::net::TcpListener;
 
@@ -7,10 +8,9 @@ async fn main() -> anyhow::Result<()> {
     let _guard = linkforge::observability::tracing::init(&settings);
     let state = linkforge::app::state::AppState::build(&settings).await?;
     let app = linkforge::app::router::create(state);
-
     let addr = format!("{}:{}", settings.server.host, settings.server.port);
     let listener = TcpListener::bind(&addr).await?;
     println!("Server is live at http://{addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }

@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -57,6 +57,11 @@ impl RateLimitState {
         tracing::info!(capacity, refill_per_sec, "rate limiter configured");
         Self { buckets: Arc::new(DashMap::new()), capacity, refill_per_sec }
     }
+    pub fn sweep(&self, idle: Duration) -> usize {
+        let before = self.buckets.len();
+        self.buckets.retain(|_, b| b.last_refill.elapsed() < idle);
+        before - self.buckets.len()
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +72,9 @@ pub struct RateLimitLayer {
 impl RateLimitLayer {
     pub fn new(cfg: RateLimitConfig) -> Self {
         Self { state: RateLimitState::from_config(&cfg) }
+    }
+    pub fn from_state(rate_limiter: RateLimitState) -> Self {
+        Self { state: rate_limiter }
     }
 }
 

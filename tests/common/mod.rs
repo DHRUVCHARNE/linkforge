@@ -31,6 +31,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use linkforge::middleware::rate_limit::RateLimitState;
+use linkforge::repositories::click_repository::SqlxClickRepository;
+use linkforge::services::analytics::AnalyticsService;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
 use uuid::Uuid;
@@ -38,10 +41,10 @@ use uuid::Uuid;
 use linkforge::app::router;
 use linkforge::app::state::AppState;
 use linkforge::cache::{Cache, InMemoryCache};
-use linkforge::config::RateLimitConfig;
+use linkforge::config::{AnalyticsConfig, RateLimitConfig};
 use linkforge::domain::short_code::ShortCode;
-use linkforge::repositories::LinkRepository;
 use linkforge::repositories::link_repository::SqlxLinkRepository;
+use linkforge::repositories::{ClickRepository, LinkRepository};
 use linkforge::services::{redirect::RedirectService, shortener::ShortenerService};
 
 /// Negative-cache TTL used by the harness. Short enough that a test can wait
@@ -50,7 +53,7 @@ const TEST_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 
 /// Effectively unlimited. Tests exercise handlers, not the limiter.
 fn permissive_rate_limit() -> RateLimitConfig {
-    RateLimitConfig { requests: 1_000_000, window_secs: 1 }
+    RateLimitConfig { requests: 1_000_000, window_secs: 1, sweep_interval: 300, idle_ttl: 3600 }
 }
 
 /// Connection string for the Postgres *server*. Falls back to the local
@@ -97,7 +100,13 @@ impl TestApp {
     /// Example: `TestApp::spawn_with_rate_limit(5, 60)` allows 5 requests
     /// before rejecting.
     pub async fn spawn_with_rate_limit(requests: u32, window_secs: u64) -> Self {
-        Self::spawn_with_config(RateLimitConfig { requests, window_secs }).await
+        Self::spawn_with_config(RateLimitConfig {
+            requests,
+            window_secs,
+            sweep_interval: 300,
+            idle_ttl: 3600,
+        })
+        .await
     }
 
     async fn spawn_with_config(rate_limit: RateLimitConfig) -> Self {
@@ -237,6 +246,15 @@ impl RestartedApp {
             .expect("request to /shorten failed")
     }
 }
+pub fn test_analytics_config() -> AnalyticsConfig {
+    AnalyticsConfig {
+        channel_capacity: 10_000,
+        max_batch: 500,
+        batch_wait_ms: 5,
+        ip_salt: "test-salt".into(),
+        click_mode:linkforge::config::ClickMode::Async
+    }
+}
 
 /// Wire up services over a pool, bind an ephemeral port, and serve.
 ///
@@ -254,18 +272,29 @@ async fn spawn_server(
         .await
         .expect("failed to read max id");
 
-    let links: Arc<dyn LinkRepository> = Arc::new(SqlxLinkRepository::new(pool));
+    let links: Arc<dyn LinkRepository> = Arc::new(SqlxLinkRepository::new(pool.clone()));
     let cache: Arc<dyn Cache> = Arc::new(InMemoryCache::new(TEST_NEGATIVE_TTL));
-
+    let analytics_settings = test_analytics_config();
     let shortener =
         Arc::new(ShortenerService::new(links.clone(), cache.clone(), start_id as u64 + 1));
-    let redirect = Arc::new(RedirectService::new(links.clone(), cache.clone()));
+    let click_repo: Arc<dyn ClickRepository> = Arc::new(SqlxClickRepository::new(pool));
+    let clicks =
+        linkforge::workers::analytics_writer::spawn(click_repo.clone(), &analytics_settings);
+    let redirect = Arc::new(RedirectService::new(
+        links.clone(),
+        cache.clone(),
+        clicks.clone(),
+        Arc::from(analytics_settings.ip_salt),
+        linkforge::config::ClickMode::Async,
+        click_repo.clone()
+    ));
+    let analytics = Arc::new(AnalyticsService::new(click_repo.clone(), links.clone()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind ephemeral test port");
     let addr: SocketAddr = listener.local_addr().expect("listener has no local addr");
-
+    let rate_limiter = RateLimitState::from_config(&rate_limit);
     let state = AppState {
         shortener,
         redirect,
@@ -274,6 +303,10 @@ async fn spawn_server(
         links,
         debug_routes: true,
         rate_limit,
+        analytics,
+        rate_limiter,
+        clicks,
+        click_mode:linkforge::config::ClickMode::Async
     };
 
     let app = router::create(state);

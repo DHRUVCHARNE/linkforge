@@ -213,3 +213,210 @@ is available on error paths, and on demand by building without
 
 This is a deliberate trade: per-request events cost ~20% throughput
 (measured). A redirect service needs correlation on failures, not successes.
+## Phase 4 — Background work & channels  ✅ M4: It's fast
+
+Env: GitHub Codespaces, 2 vCPU · Postgres + Redis co-located · **release build** · fresh database
+Hot read path `GET /:code`, oha 10s @ c=100, keepalive on
+Server in BENCH MODE (`RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1`)
+
+Each redirect now records a click. `CLICK_MODE` selects how:
+
+- `sync`: the redirect awaits `INSERT INTO clicks` before responding
+- `async` (default): the redirect calls `try_send` on a bounded `mpsc` channel; a background worker batches the inserts
+
+### Acceptance — redirect p99, async vs sync
+
+| Mode        | req/s  | p50      | p99           | p99.9     | DNS+dialup |
+| ----------- | ------ | -------- | ------------- | --------- | ---------- |
+| sync        | 1,532  | 56.82 ms | **191.80 ms** | 268.26 ms | 4.45 ms    |
+| async run A | 15,146 | 5.85 ms  | 18.99 ms      | 30.53 ms  | 4.10 ms    |
+| async run B | 15,979 | 5.65 ms  | **17.74 ms**  | 27.10 ms  | 5.74 ms    |
+
+**p99 improvement: 90.8%** (threshold ≥ 20%). **Throughput: 10.4×.**
+The two async runs agree to within ~5%, and every run had DNS+dialup below 7 ms (no host contention).
+
+### Why sync is slow
+
+Each redirect holds a pool connection until its INSERT commits, so 100 clients queue
+for 20 connections. Little's Law: 1,532 × 0.0654 s ≈ 100. The system is saturated, and
+requests spend most of their time waiting for a connection rather than running SQL.
+
+### Writer behaviour (async run B)
+
+| Metric                                         | Value   |
+| ---------------------------------------------- | ------- |
+| Clicks enqueued                                | 162,262 |
+| Batches                                        | 329     |
+| Avg rows per INSERT                            | 493.2   |
+| Failed batches                                 | 0       |
+| Queue depth after load                         | 0       |
+| Conservation gap (enqueued − written − queued) | 0       |
+
+Batching leaves Postgres doing about 33 INSERTs/s to persist about 16k clicks/s.
+
+### Click accounting
+
+2,000 redirects → **exactly 2,000 rows**, visible through `/stats` in 22–27 ms. 0 dropped.
+
+### Backpressure: drop on full
+
+| Run     | req/s  | Dropped      |
+| ------- | ------ | ------------ |
+| async A | 15,146 | 9,867 (6.5%) |
+| async B | 15,979 | 0 (0%)       |
+
+At ~15–16k req/s the writer runs close to the arrival rate, so whether the channel fills
+depends on timing. Report drops as a range: **0–6.5% at ~15–16k req/s**.
+
+Dropping is deliberate. `try_send` never waits, so a slow database can't slow a redirect,
+and the bounded channel caps memory use. The cost is an undercount; the alternative costs
+~10× in p99. Dropped clicks are counted, so the loss is visible.
+
+### Carried forward (still passing)
+
+| Probe                   | Result                                                      |
+| ----------------------- | ----------------------------------------------------------- |
+| 10,000 concurrent POSTs | 10,000 unique codes, 0 duplicates, 0 failures               |
+| Negative caching        | 500 repeat 404s → **0 DB queries**                          |
+| 404s record clicks      | **none** (stops scanners from filling the analytics table)  |
+| Single-flight           | 30 concurrent misses → **1 DB query**                       |
+| Request ID              | echoed · generated · distinct · present on 404 and `/stats` |
+| Hit ratio               | 99.98% → expected ~358 ns/lookup                            |
+
+### `GET /:code/stats` contract
+
+| Case                    | Result                        |
+| ----------------------- | ----------------------------- |
+| Existing, never clicked | `200 {"code":"…","clicks":0}` |
+| Unknown code            | `404` (not `clicks: 0`)       |
+| Malformed code          | `404`                         |
+| Reading `/stats`        | records no clicks             |
+| Content-Type            | `application/json`            |
+
+### Application-level (criterion, HTTP excluded)
+
+| Path                     | Phase 2   | Phase 4   | Verdict                          |
+| ------------------------ | --------- | --------- | -------------------------------- |
+| `InMemoryCache::get` hit | 219.38 ns | 265.25 ns | no significant change (p = 0.06) |
+| `find_by_code` (DB)      | 450.01 µs | 628.72 µs | no significant change (p = 0.27) |
+
+⚠️ `find_by_code` keeps rising from phase to phase. The likely cause is that `docker compose down`
+without `-v` keeps the volume, so `links` and `clicks` grow across runs.
+
+### ⚠️ Cost of analytics on the hot path
+
+| Config              | req/s  | p50     | p99      |
+| ------------------- | ------ | ------- | -------- |
+| Phase 3 (no clicks) | 27,106 | 3.35 ms | 9.78 ms  |
+| Phase 4 async       | 15,979 | 5.65 ms | 17.74 ms |
+
+Building a click on every redirect (a `String` allocation, SHA-256 of the IP, and `try_send`)
+costs **~41% throughput**. **Not yet measured.** The most likely main cost is SHA-256.
+Benchmark `hash_ip` before optimising.
+
+### Rate-limit bucket sweeper
+
+`workers/bucket_sweeper.rs` evicts idle buckets from the limiter's `DashMap`, using the same
+map as the middleware via `RateLimitState`. It is started from `AppState::build()`.
+
+Verified with `RATE_LIMIT_SWEEP_INTERVAL=2 RATE_LIMIT_IDLE_TTL=3`:
+
+    INFO linkforge::workers::bucket_sweeper: swept idle rate-limiting buckets, evicted: 1
+
+Evicting a bucket created by a real request shows the sweeper shares the limiter's map.
+Eviction long before the 300 s / 3600 s defaults could fire shows both overrides were read.
+
+### ⚠️ Methodology
+
+Both runs must meet all four of these, or the comparison is invalid:
+
+1. **Release build:** `cargo run --release`
+2. **Fresh database:** `docker compose down -v && docker compose up -d`
+3. **Bench-mode rate limit:** otherwise the limiter throttles the harness
+4. **Matching `CLICK_MODE`** on server and script (the script aborts on a mismatch)
+
+```bash
+CLICK_MODE=sync  RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 cargo run --release
+CLICK_MODE=sync  ./scripts/load_test.sh
+
+CLICK_MODE=async RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 cargo run --release
+CLICK_MODE=async ./scripts/load_test.sh     # probe 10 prints the verdict
+```
+
+Raw results: `.loadtest/phase4_{sync,async}.env` and `.loadtest/phase4_{sync,async}_oha.txt`.
+
+`CLICK_MODE=sync` is kept as a supported mode: exact counts at ~10× lower throughput, and the
+regression baseline for later phases. The default is `async`.
+### Rate-limit bucket sweeper
+
+**Problem.** The Phase 3 rate limiter stores one token bucket per client IP in an
+in-process `DashMap<IpAddr, Bucket>`. Nothing ever removed entries, so the map grew by
+one entry (~60 B) for every distinct client, forever. A scanner rotating through IPv6
+addresses could grow it quickly.
+
+**Why Redis TTLs don't fix this.** Phase 6 moves the *link cache* to Redis behind the
+`Cache` trait. The limiter's map is a separate structure that stays in-process, so it
+needs its own cleanup. (Moving rate limiting into Redis was considered and rejected:
+it would add a network round trip to every request in exchange for multi-instance
+correctness this project doesn't need yet.)
+
+**Design.**
+
+| Concern | Location | Why |
+| --- | --- | --- |
+| Eviction rule | `RateLimitState::sweep(idle)` | `Bucket` fields are private to `rate_limit.rs` |
+| Timer loop | `workers/bucket_sweeper.rs` | background tasks live in `workers/`, next to the analytics writer |
+| Startup | `AppState::build()` | one place starts every background task; Phase 5 shutdown stops them there |
+| Shared map | `RateLimitLayer::from_state(state.rate_limiter.clone())` | the middleware and the sweeper must use the **same** `Arc<DashMap>` |
+
+`last_refill` doubles as a "last seen" timestamp, because it's updated on every
+request, including rejected ones. A bucket idle longer than `idle_ttl` is evicted:
+
+```rust
+pub fn sweep(&self, idle: Duration) -> usize {
+    let before = self.buckets.len();
+    self.buckets.retain(|_, b| b.last_refill.elapsed() < idle);
+    before - self.buckets.len()
+}
+```
+
+**Rejected alternative: spawning inside `RateLimitState::from_config()`.** That
+would hide a side effect in a constructor, start one sweeper per router (and so one
+per test, never stopped), and leave Phase 5's graceful shutdown no single place to
+stop it.
+
+**Configuration.**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RATE_LIMIT_SWEEP_INTERVAL` | 300 | seconds between sweeps |
+| `RATE_LIMIT_IDLE_TTL` | 3600 | seconds of inactivity before a bucket is evicted |
+
+⚠️ Invariant: `RATE_LIMIT_IDLE_TTL ≥ RATE_LIMIT_WINDOW_SECS`. If a bucket is evicted
+before its window ends, that client gets a fresh, full bucket on its next request,
+raising its effective rate limit.
+
+**Cost.** `DashMap::retain` is synchronous and write-locks each shard in turn. At a
+300 s interval over thousands of entries this takes microseconds, but it briefly
+blocks requests touching the shard being swept. Keep this in mind before lowering the
+interval.
+
+**Verification.** Run with `RATE_LIMIT_SWEEP_INTERVAL=2 RATE_LIMIT_IDLE_TTL=3`:
+
+    INFO linkforge::workers::bucket_sweeper: swept idle rate-limiting buckets, evicted: 1
+
+| Property | Evidence |
+| --- | --- |
+| Spawned and running | an entry was evicted |
+| Shares the limiter's map | it evicted a bucket created by a real request; a separate map would always be empty |
+| Interval override read | it swept long before the 300 s default could fire |
+| TTL override read | it evicted long before the 3600 s default could expire the bucket |
+
+The sweeper logs only when it evicts something, so the timestamp shows when the bucket
+expired, not when the first sweep ran.
+
+**Follow-ups.**
+- Rename to `RATE_LIMIT_SWEEP_INTERVAL_SECS` / `RATE_LIMIT_IDLE_TTL_SECS` to match `RATE_LIMIT_WINDOW_SECS`
+- Check `idle_ttl ≥ window_secs` at startup and fail fast if it doesn't hold
+- Log the interval and TTL when the sweeper starts
+- The test harness builds `RateLimitState` without a sweeper, so tests leave no background tasks running

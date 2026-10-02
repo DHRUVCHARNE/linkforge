@@ -115,10 +115,20 @@ dev: up
     @just migrate
     @echo "✅ Stack is up and migrated. Run 'just run' to start the app."
 
-# Load test (Phase 3 harness)
-load-test:
+
+reset: 
+   just down
+   just up
+
+# Start the server in bench mode. Usage: just bench-server sync|async
+bench-server mode="async":
+    CLICK_MODE={{mode}} RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 \
+      cargo run --release
+
+# Run the load test against an already-running server. Usage: just load-test sync|async
+load-test mode="async":
     just down 
     just up
     LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
     LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 \
-    ./scripts/load_test.sh
+    CLICK_MODE={{mode}} ./scripts/load_test.sh

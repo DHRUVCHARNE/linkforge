@@ -2,60 +2,83 @@
 #
 # load_test.sh — LinkForge load / correctness / benchmark harness
 #
-# Phase 3: Postgres + read-through cache + negative caching + single-flight
-#          + tracing + x-request-id + per-IP token-bucket rate limiting.
+# Phase 4: Postgres + read-through cache + negative caching + single-flight
+#          + tracing + request ids + per-IP rate limiting
+#          + bounded mpsc click pipeline + batched analytics writer.
 #
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # DESIGN PRINCIPLE: A TEST THAT PASSES FOR THE WRONG REASON IS WORSE THAN ONE
 # THAT FAILS.
-# ---------------------------------------------------------------------------
-# Earlier revisions of this script reported PASS while proving nothing:
+# ===========================================================================
+# Every probe follows the same shape:
+#   1. ESTABLISH a precondition
+#   2. VERIFY it actually took effect
+#   3. ACT
+#   4. ASSERT the outcome AND that the probe did real work
 #
-#   1. The "nonexistent" probe codes were 12-15 chars, but ShortCode::parse
-#      enforces 1..=10. Every request was rejected by DOMAIN VALIDATION before
-#      the cache was consulted. Counters stayed flat, and "0 misses" was read
-#      as success.
-#   2. The single-flight probe's invalidate call failed silently (`|| red`
-#      does not abort under `set -e`), so all 200 requests hit a WARM cache.
-#   3. The single-flight probe measured `misses` (the CACHE layer) to infer DB
-#      queries — but coalescing happens BELOW the cache. The probe was
-#      structurally incapable of observing the thing it tested.
+# Earlier revisions of this script passed vacuously because of: probe codes
+# that failed domain validation, an invalidate call that failed silently, a
+# single-flight probe that read the wrong layer's counter, a rate limiter
+# throttling the harness itself, and a debug-build server. Each guard below
+# exists because one of those actually happened.
 #
-# ---------------------------------------------------------------------------
-# THE NEW PHASE 3 HAZARD: THE RATE LIMITER THROTTLES THIS SCRIPT
-# ---------------------------------------------------------------------------
-# Every request from this script originates at one IP, so they all share ONE
-# token bucket. At ~9,700 req/s any sane bucket rejects the overwhelming
-# majority. A throughput probe that is being rate limited measures the
-# LIMITER, not the handler — numbers that look plausible and mean nothing.
+# ===========================================================================
+# PHASE 4 ACCEPTANCE (from LINKFORGE.md §7)
+# ===========================================================================
+#   "redirect p99 under load is materially better than synchronous writes —
+#    prove it with the Phase 3 harness."
 #
-# This script therefore:
-#   * detects throttling explicitly before trusting any measurement
-#   * counts 429s during load and FAILS if they appear in a non-limiter probe
-#   * requires the server to be started with a benchmark-scale bucket
-#     (see BENCH MODE below)
-#   * exercises the limiter deliberately in ONE probe that expects 429s
+# A shell script cannot restart the server in a different mode, so the
+# comparison is done ACROSS TWO RUNS. Each run records its numbers to
+# ${RESULTS_DIR}/phase4_<mode>.env; once both files exist, probe 10 compares
+# them and issues the verdict.
 #
-# BENCH MODE: start the server with a bucket that cannot interfere, e.g.
-#   LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
-#   LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 just run
-# then run this script. Probe 6 (rate limiting) spells out how it verifies
-# the limiter separately.
+#   # Run A — synchronous click writes (the baseline to beat)
+#   CLICK_MODE=sync  RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 \
+#     cargo run --release
+#   CLICK_MODE=sync  ./scripts/load_test.sh
 #
-# ---------------------------------------------------------------------------
+#   # Run B — bounded channel + batched writer
+#   CLICK_MODE=async RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 \
+#     cargo run --release
+#   CLICK_MODE=async ./scripts/load_test.sh
+#
+# CLICK_MODE in THIS script is only a label for the results file. It must
+# match how the server was started, which the script verifies via
+# /debug/analytics when available.
+#
+# ===========================================================================
 # REQUIREMENTS
-# ---------------------------------------------------------------------------
-#   * A running LinkForge server (`just run`)
-#   * Dev-only introspection routes, registered when env = development:
+# ===========================================================================
+#   * A RELEASE build: `cargo run --release`. A debug build measured ~5x
+#     lower throughput on this project and invalidated an entire phase of
+#     baselines. The script cannot detect the profile — you must.
+#   * BENCH MODE rate limit (the harness is one IP and would throttle itself):
+#       RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1
+#   * A FRESH database (`just down && just up`). Write throughput degrades as
+#     tables grow; numbers from a bloated DB are not comparable.
+#   * Dev-only routes (APP_ENV=development):
 #       GET  /debug/cache
-#         -> {"hits":N,"negative_hits":N,"misses":N,"db_queries":N,"ratio":F}
+#         -> {"hits","negative_hits","misses","db_queries","ratio"}
 #       POST /debug/cache/invalidate/{code}
-#   * Optional: `oha` (strongly preferred) or `wrk` for load generation
+#       GET  /debug/analytics          (Phase 4, see bottom of file)
+#         -> {"enqueued","dropped","batches","rows_written","failed_batches",
+#             "queue_depth","mode"}
+#   * oha (cargo install oha). wrk is not supported for Phase 4 probes,
+#     because the p99 comparison needs oha's percentile output.
 #
 # Usage:
 #   ./scripts/load_test.sh [BASE_URL] [N_REQUESTS] [CONCURRENCY]
 #
-# Exit code: 0 if every probe passed, 1 otherwise (CI-friendly).
+# Env:
+#   CLICK_MODE=sync|async     label for this run's results (default async)
+#   RESULTS_DIR=dir           where run results are stored (default .loadtest)
+#   ONLY=1,2,8                run only these probes
+#   SKIP=6                    skip these probes
+#   LOAD_DURATION=10s
+#   CLICK_PROBE_REQUESTS=2000 redirects fired by the click-accounting probe
+#
+# Exit code: 0 if every probe passed, 1 otherwise.
 #
 set -euo pipefail
 
@@ -66,75 +89,106 @@ BASE_URL="${1:-http://localhost:3000}"
 N="${2:-10000}"
 CONCURRENCY="${3:-100}"
 
-NEG_PROBE_REQUESTS="${NEG_PROBE_REQUESTS:-500}"
-SF_PROBE_REQUESTS="${SF_PROBE_REQUESTS:-200}"
+CLICK_MODE="${CLICK_MODE:-async}"
+RESULTS_DIR="${RESULTS_DIR:-.loadtest}"
 LOAD_DURATION="${LOAD_DURATION:-10s}"
 
-# How many rapid requests probe 6 fires to prove the limiter engages. Must
-# exceed the server's configured bucket capacity, or the probe cannot trip it.
-RL_PROBE_REQUESTS="${RL_PROBE_REQUESTS:-300}"
+NEG_PROBE_REQUESTS="${NEG_PROBE_REQUESTS:-500}"
+SF_PROBE_REQUESTS="${SF_PROBE_REQUESTS:-200}"
+CLICK_PROBE_REQUESTS="${CLICK_PROBE_REQUESTS:-2000}"
+CLICK_SETTLE_TIMEOUT_S="${CLICK_SETTLE_TIMEOUT_S:-15}"
 
-# Measured application-level costs (from `cargo bench`). Used to translate a
-# hit ratio into an expected per-lookup cost. Update when the bench changes.
-BENCH_HIT_NS="${BENCH_HIT_NS:-219}"
-BENCH_MISS_NS="${BENCH_MISS_NS:-450000}"
+# Phase 4 verdict threshold: async p99 must be at least this much lower than
+# sync p99 to count as "materially better". 20% is deliberately well above
+# the ~2-7% run-to-run noise measured on this hardware.
+MATERIAL_IMPROVEMENT_PCT="${MATERIAL_IMPROVEMENT_PCT:-20}"
+
+# Measured application-level costs (cargo bench, release, Phase 3).
+BENCH_HIT_NS="${BENCH_HIT_NS:-260}"
+BENCH_MISS_NS="${BENCH_MISS_NS:-492000}"
 
 STATS_URL="${BASE_URL}/debug/cache"
+ANALYTICS_URL="${BASE_URL}/debug/analytics"
 FAILURES=0
 WARNINGS=0
+
+mkdir -p "${RESULTS_DIR}"
+RESULT_FILE="${RESULTS_DIR}/phase4_${CLICK_MODE}.env"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+case "${CLICK_MODE}" in
+  sync|async) ;;
+  *) echo "CLICK_MODE must be 'sync' or 'async' (got '${CLICK_MODE}')"; exit 2 ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]]; then
   C_GREEN=$'\033[0;32m'; C_RED=$'\033[0;31m'; C_CYAN=$'\033[0;36m'
-  C_YELLOW=$'\033[0;33m'; C_BOLD=$'\033[1m';  C_RESET=$'\033[0m'
+  C_YELLOW=$'\033[0;33m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
 else
-  C_GREEN=''; C_RED=''; C_CYAN=''; C_YELLOW=''; C_BOLD=''; C_RESET=''
+  C_GREEN=''; C_RED=''; C_CYAN=''; C_YELLOW=''; C_BOLD=''; C_DIM=''; C_RESET=''
 fi
 
-green() { printf '%s%s%s\n' "${C_GREEN}"  "$*" "${C_RESET}"; }
-red()   { printf '%s%s%s\n' "${C_RED}"    "$*" "${C_RESET}"; }
-info()  { printf '%s%s%s\n' "${C_CYAN}"   "$*" "${C_RESET}"; }
-warn()  { printf '%s%s%s\n' "${C_YELLOW}" "$*" "${C_RESET}"; WARNINGS=$(( WARNINGS + 1 )); }
+green() { printf '%s%s%s\n' "${C_GREEN}" "$*" "${C_RESET}"; }
+red()   { printf '%s%s%s\n' "${C_RED}"   "$*" "${C_RESET}"; }
+info()  { printf '%s%s%s\n' "${C_CYAN}"  "$*" "${C_RESET}"; }
 hdr()   { printf '\n%s%s%s\n' "${C_BOLD}" "$*" "${C_RESET}"; }
 
-pass()    { green "  PASS: $*"; }
-fail()    { red   "  FAIL: $*"; FAILURES=$(( FAILURES + 1 )); }
-skipped() { printf '%s  SKIPPED: %s%s\n' "${C_YELLOW}" "$*" "${C_RESET}"; }
+pass()    { green "  PASS  $*"; }
+fail()    { red   "  FAIL  $*"; FAILURES=$(( FAILURES + 1 )); }
+warn()    { printf '%s  WARN  %s%s\n' "${C_YELLOW}" "$*" "${C_RESET}"; WARNINGS=$(( WARNINGS + 1 )); }
+skipped() { printf '%s  SKIP  %s%s\n' "${C_DIM}" "$*" "${C_RESET}"; }
 detail()  { printf '        %s\n' "$*"; }
+
+should_run() {
+  local id="$1"
+  if [[ -n "${ONLY:-}" ]]; then [[ ",${ONLY}," == *",${id},"* ]] || return 1; fi
+  if [[ -n "${SKIP:-}" ]]; then [[ ",${SKIP}," == *",${id},"* ]] && return 1; fi
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # HTTP / stats helpers
 # ---------------------------------------------------------------------------
+http_code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+http_time() { curl -s -o /dev/null -w '%{time_total}' "$@"; }
 
-has_stats() { curl -fsS "${STATS_URL}" >/dev/null 2>&1; }
-
-# Read a numeric field from /debug/cache. Returns 0 if absent so arithmetic
-# never explodes — a permanently-zero counter is caught by anti-vacuity checks.
-stat_field() {
-  local val
-  val="$(curl -s "${STATS_URL}" 2>/dev/null \
-        | grep -o "\"$1\":[0-9.]*" | head -n1 | sed 's/.*://')" || true
+# Read a numeric field from a JSON endpoint. Returns 0 if absent so arithmetic
+# never explodes; anti-vacuity checks catch a permanently-zero counter.
+json_num() {
+  local url="$1" field="$2" val
+  val="$(curl -s "${url}" 2>/dev/null \
+        | grep -o "\"${field}\":[0-9.]*" | head -n1 | sed 's/.*://')" || true
   printf '%s' "${val:-0}"
 }
+json_str() {
+  local url="$1" field="$2"
+  curl -s "${url}" 2>/dev/null \
+    | grep -o "\"${field}\":\"[^\"]*\"" | head -n1 | sed 's/.*:"//; s/"$//' || true
+}
 
-assert_stats_schema() {
-  local body missing=""
-  body="$(curl -s "${STATS_URL}")"
-  for f in hits negative_hits misses db_queries; do
+stat_field()      { json_num "${STATS_URL}" "$1"; }
+analytics_field() { json_num "${ANALYTICS_URL}" "$1"; }
+
+has_endpoint() { curl -fsS "$1" >/dev/null 2>&1; }
+
+assert_schema() {
+  local url="$1" label="$2"; shift 2
+  local body missing="" f
+  body="$(curl -s "${url}")"
+  for f in "$@"; do
     grep -q "\"${f}\"" <<<"${body}" || missing="${missing} ${f}"
   done
   if [[ -n "${missing}" ]]; then
-    fail "/debug/cache is missing field(s):${missing}"
-    detail "Probes depending on them cannot run. Add them to handlers/debug.rs."
+    warn "${label} is missing field(s):${missing}"
     return 1
   fi
   return 0
 }
-
-http_code() { curl -s -o /dev/null -w '%{http_code}' "$1"; }
-http_time() { curl -s -o /dev/null -w '%{time_total}' "$1"; }
 
 extract_code() { grep -o '"code":"[^"]*"' | head -n1 | sed 's/.*:"//; s/"//'; }
 
@@ -148,619 +202,718 @@ invalidate() {
   curl -fsS -X POST "${BASE_URL}/debug/cache/invalidate/$1" >/dev/null 2>&1
 }
 
-# Generate a syntactically VALID short code unlikely to exist.
-# CRITICAL: must satisfy ShortCode::parse (base62, length 1..=10), or the
-# request is rejected by the domain layer and NEVER REACHES THE CACHE.
+# Must satisfy ShortCode::parse (base62, length 1..=10), or the request is
+# rejected by the domain layer and never reaches the cache.
 random_valid_code() {
   LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 8 || true
 }
 
-assert_well_formed() {
-  local code="$1" label="$2" status
-  status="$(http_code "${BASE_URL}/${code}")"
-  case "${status}" in
-    400) fail "${label}: code '${code}' rejected as malformed (400)."
-         detail "It never reached the cache. Check ShortCode::parse constraints."
-         return 1 ;;
-    404) return 0 ;;
-    429) fail "${label}: rate limited (429) — cannot establish a baseline."
-         detail "Restart the server in BENCH MODE (see header)."
-         return 1 ;;
-    *)   fail "${label}: unexpected status ${status} for a nonexistent code."
-         return 1 ;;
-  esac
-}
+is_throttled() { [[ "$(http_code "${BASE_URL}/health")" == "429" ]]; }
 
-# --- PHASE 3: throttle detection -------------------------------------------
-#
-# Returns 0 if a single request is currently being rate limited. Used as a
-# precondition guard: any probe that measures something OTHER than the limiter
-# must first confirm it is not being throttled.
-is_throttled() {
-  [[ "$(http_code "${BASE_URL}/health")" == "429" ]]
-}
+# Read clicks for a code via the PUBLIC stats endpoint (black-box), not via
+# the database. This verifies the whole path: redirect -> channel -> writer
+# -> Postgres -> stats query -> JSON.
+stats_clicks() { json_num "${BASE_URL}/$1/stats" clicks; }
 
-# Abort a probe if the limiter is interfering. The whole point: a throttled
-# measurement is not a measurement of the thing under test.
-guard_not_throttled() {
-  local label="$1"
-  if is_throttled; then
-    fail "${label}: server is rate limiting this client."
-    detail "Measurements would reflect the limiter, not the handler."
-    detail "Restart in BENCH MODE (see script header) and rerun."
-    return 1
-  fi
-  return 0
-}
-
-# Fire N requests at one URL with genuine concurrency.
-#
-# Prefer oha: it uses async tasks, so requests truly overlap. `xargs -P` spawns
-# PROCESSES (~1-5ms startup each) — far slower than a ~450us query — so the
-# leader finishes before later requests start and coalescing is understated.
-fire_concurrent() {
-  local url="$1" count="$2"
-  if command -v oha >/dev/null 2>&1; then
-    oha -n "${count}" -c "${count}" --no-tui "${url}" >/dev/null 2>&1 || true
-  else
-    seq "${count}" | xargs -P"${count}" -I{} curl -s -o /dev/null "${url}"
-  fi
-}
-
-# Fire N sequential requests, printing one status code per line. Used by the
-# rate-limit probe, which needs the STATUS DISTRIBUTION, not just a total.
-fire_sequential_statuses() {
-  local url="$1" count="$2" i
-  for (( i = 0; i < count; i++ )); do
-    http_code "${url}"
-    printf '\n'
+# Poll until the stats endpoint reports at least `expected` clicks, or time
+# out. Never use a fixed sleep: the writer flushes asynchronously and a fixed
+# sleep is either flaky (too short) or slow (too long).
+wait_for_clicks() {
+  local code="$1" expected="$2" timeout_s="$3"
+  local deadline=$(( $(date +%s) + timeout_s )) n=0
+  while [[ "$(date +%s)" -lt "${deadline}" ]]; do
+    n="$(stats_clicks "${code}")"
+    [[ "${n}" -ge "${expected}" ]] && { printf '%s' "${n}"; return 0; }
+    sleep 0.2
   done
+  printf '%s' "${n}"
+  return 1
 }
+
+# Run oha and extract rps / p50 / p99 / status distribution into
+# OHA_RPS, OHA_P50, OHA_P99, OHA_3XX, OHA_429, OHA_DIALUP.
+run_oha() {
+  local out="$1"; shift
+  oha --no-tui "$@" > "${out}" 2>&1 || true
+  OHA_RPS="$(grep -o 'Requests/sec:[[:space:]]*[0-9.]*' "${out}" | grep -o '[0-9.]*$' | head -n1 || true)"
+  OHA_P50="$(grep -E '^[[:space:]]*50(\.00)?% in' "${out}" | grep -o '[0-9.]* ms' | grep -o '[0-9.]*' | head -n1 || true)"
+  OHA_P99="$(grep -E '^[[:space:]]*99(\.00)?% in' "${out}" | grep -o '[0-9.]* ms' | grep -o '[0-9.]*' | head -n1 || true)"
+  OHA_DIALUP="$(grep -o 'DNS+dialup:[[:space:]]*[0-9.]*' "${out}" | grep -o '[0-9.]*$' | head -n1 || true)"
+  OHA_3XX="$(grep -oE '\[3[0-9]{2}\][[:space:]]*[0-9]+' "${out}" | awk '{s+=$2} END{print s+0}')"
+  OHA_429="$(grep -oE '\[429\][[:space:]]*[0-9]+' "${out}" | awk '{print $2}' | head -n1 || true)"
+  OHA_RPS="${OHA_RPS:-0}"; OHA_P50="${OHA_P50:-0}"; OHA_P99="${OHA_P99:-0}"
+  OHA_DIALUP="${OHA_DIALUP:-0}"; OHA_429="${OHA_429:-0}"
+}
+
+# Record a key=value into this run's results file.
+record() { printf '%s=%s\n' "$1" "$2" >> "${RESULT_FILE}.tmp"; }
 
 # ===========================================================================
 # 0. PRE-FLIGHT
 # ===========================================================================
-hdr "0. Pre-flight"
+hdr "0. Pre-flight  (CLICK_MODE=${CLICK_MODE})"
 
-info "==> Health check: ${BASE_URL}/health"
-if ! curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
-  # A 429 makes curl -f fail too — distinguish the two so the operator gets an
-  # actionable message rather than "server is down".
-  if [[ "$(http_code "${BASE_URL}/health")" == "429" ]]; then
-    red "Server is UP but already rate limiting this client."
-    red "Restart in BENCH MODE (see script header) before load testing."
-    exit 1
-  fi
-  red "Server is not responding at ${BASE_URL}. Start it first (just run)."
+PING="$(http_code "${BASE_URL}/health")"
+case "${PING}" in
+  200) green "  Server is up." ;;
+  429) red "  Server is UP but already throttling this client."
+       red "  Restart with RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1."
+       exit 1 ;;
+  000) red "  Server is not responding at ${BASE_URL}. Start it (cargo run --release)."
+       exit 1 ;;
+  *)   red "  /health returned ${PING}, expected 200."; exit 1 ;;
+esac
+
+command -v oha >/dev/null 2>&1 || {
+  red "  oha is required for Phase 4 (p99 extraction). cargo install oha"
   exit 1
-fi
-green "  Server is up."
+}
 
 STATS_AVAILABLE=0
-if has_stats && assert_stats_schema; then
+if has_endpoint "${STATS_URL}" \
+   && assert_schema "${STATS_URL}" "/debug/cache" hits negative_hits misses db_queries; then
   STATS_AVAILABLE=1
-  green "  Cache stats endpoint available with full schema."
+  green "  /debug/cache available."
 else
-  warn "/debug/cache unavailable or incomplete."
-  detail "Cache-aware probes will be SKIPPED (not silently passed)."
-  detail "Set env = development so app/router.rs registers the debug routes."
+  warn "/debug/cache unavailable — cache probes (3, 4) will be SKIPPED."
 fi
 
-command -v oha >/dev/null 2>&1 \
-  || warn "oha not installed — concurrency probes will use the weaker xargs path."
+ANALYTICS_AVAILABLE=0
+if has_endpoint "${ANALYTICS_URL}" \
+   && assert_schema "${ANALYTICS_URL}" "/debug/analytics" enqueued dropped rows_written; then
+  ANALYTICS_AVAILABLE=1
+  green "  /debug/analytics available."
 
-# --- PHASE 3: headline bucket-capacity check -------------------------------
-#
-# Burst a modest number of requests. If ANY are rejected, the configured bucket
-# is far too small for a benchmark and every subsequent number is suspect.
-info "==> Rate limiter headroom check"
-RL_PREFLIGHT_N=50
-RL_PREFLIGHT_429="$(
-  fire_sequential_statuses "${BASE_URL}/health" "${RL_PREFLIGHT_N}" \
-    | grep -c '^429$' || true
+  # Verify the label matches the server. Mislabelled runs would make probe 10
+  # compare two async runs and declare a win that does not exist.
+  SERVER_MODE="$(json_str "${ANALYTICS_URL}" mode)"
+  if [[ -n "${SERVER_MODE}" && "${SERVER_MODE}" != "${CLICK_MODE}" ]]; then
+    red "  CLICK_MODE=${CLICK_MODE} but the server reports mode=${SERVER_MODE}."
+    red "  Results would be filed under the wrong mode. Aborting."
+    exit 1
+  fi
+  [[ -n "${SERVER_MODE}" ]] && detail "server confirms mode=${SERVER_MODE}"
+else
+  warn "/debug/analytics unavailable — pipeline accounting probes will be SKIPPED."
+  detail "Add it (see bottom of this file) so dropped/queued clicks are visible."
+fi
+
+# --- Non-destructive rate-limit check ---------------------------------------
+# A concurrent burst of 200 detects a small bucket. A benchmark-sized bucket
+# (1e8 tokens) loses nothing measurable from it.
+info "  Rate limiter headroom check (concurrent burst of 200)..."
+BURST_429="$(
+  seq 200 | xargs -P50 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+    "${BASE_URL}/health" | grep -c '^429$' || true
 )"
-detail "burst of ${RL_PREFLIGHT_N} requests -> ${RL_PREFLIGHT_429} rejected (429)"
+detail "burst of 200 -> ${BURST_429} rejected"
+if [[ "${BURST_429}" -gt 0 ]]; then
+  red "  The rate limiter engages at 200 requests. Every measurement in this"
+  red "  script would measure the limiter, not the application. Restart with:"
+  red "    RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 cargo run --release"
+  exit 1
+fi
+green "  Limiter has headroom."
 
-BENCH_MODE=1
-if [[ "${RL_PREFLIGHT_429}" -gt 0 ]]; then
-  BENCH_MODE=0
-  warn "Rate limiter engages within ${RL_PREFLIGHT_N} requests."
-  detail "Throughput and cache probes will be SKIPPED — they would measure"
-  detail "the limiter rather than the application."
-  detail "Restart in BENCH MODE (see script header) to run them."
+warn "This script cannot detect the build profile."
+detail "Confirm the server was started with --release. A debug build is ~5x"
+detail "slower on this project and would invalidate the comparison."
+
+# Start a fresh results file for this run.
+: > "${RESULT_FILE}.tmp"
+record MODE "${CLICK_MODE}"
+record TIMESTAMP "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+record CONCURRENCY "${CONCURRENCY}"
+record LOAD_DURATION "${LOAD_DURATION}"
+
+# ===========================================================================
+# 1. CORRECTNESS — concurrent writes never collide
+# ===========================================================================
+if should_run 1; then
+hdr "1. Correctness — ${N} concurrent POST /shorten (c=${CONCURRENCY})"
+
+STATUS_LOG="${TMP_DIR}/writes.log"
+seq "${N}" | xargs -P"${CONCURRENCY}" -I{} \
+  curl -s -w '\nSTATUS:%{http_code}\n' -X POST "${BASE_URL}/shorten" \
+    -H 'content-type: application/json' \
+    -d '{"url":"https://example.com/{}"}' \
+  >> "${STATUS_LOG}" 2>/dev/null || true
+
+TOTAL="$(grep -o '"code":"[^"]*"' "${STATUS_LOG}" | wc -l | tr -d ' ')"
+UNIQUE="$(grep -o '"code":"[^"]*"' "${STATUS_LOG}" | sort -u | wc -l | tr -d ' ')"
+DUPES=$(( TOTAL - UNIQUE ))
+C429="$(grep -c '^STATUS:429$' "${STATUS_LOG}" || true)"
+C5XX="$(grep -cE '^STATUS:5[0-9]{2}$' "${STATUS_LOG}" || true)"
+
+detail "generated : ${TOTAL}/${N}   unique : ${UNIQUE}   dupes : ${DUPES}"
+detail "429s : ${C429}   5xx : ${C5XX}"
+
+if [[ "${TOTAL}" -lt $(( N / 2 )) ]]; then
+  fail "only ${TOTAL}/${N} succeeded — zero duplicates among few writes proves nothing."
+elif [[ "${DUPES}" -ne 0 ]]; then
+  fail "${DUPES} duplicate code(s) under concurrency."
 else
-  green "  Limiter has headroom; measurement probes can run."
+  pass "zero duplicates across ${TOTAL} concurrent writes."
+fi
+[[ "${C429}" -gt 0 ]] && fail "${C429} writes were rate limited — this probe must not be throttled."
+if [[ "${C5XX}" -gt 0 ]]; then
+  if [[ "${C5XX}" -gt $(( N / 20 )) ]]; then
+    fail "${C5XX} writes returned 5xx (>5%)."
+  else
+    warn "${C5XX} writes returned 5xx."
+  fi
+  detail "Check the server log for the sqlx variant (PoolTimedOut vs unique violation)."
+fi
+record WRITES_OK "${TOTAL}"
 fi
 
 # ===========================================================================
-# 1. CORRECTNESS: concurrent writes must never collide
+# 2. THROUGHPUT — hot read path (cache hits + click emission)
+#
+# This is THE Phase 4 measurement. Every redirect now also produces a click,
+# so this run measures the redirect path INCLUDING the analytics cost:
+#   sync  : each redirect awaits an INSERT before responding
+#   async : each redirect does a non-blocking try_send
+# The p99 recorded here is what probe 10 compares across modes.
 # ===========================================================================
-hdr "1. Correctness probe — ${N} concurrent POST /shorten (c=${CONCURRENCY})"
+if should_run 2; then
+hdr "2. Throughput — hot read path GET /:code (${LOAD_DURATION}, c=${CONCURRENCY})"
 
-if [[ "${BENCH_MODE}" -eq 0 ]]; then
-  skipped "rate limiter would reject most writes; results would be meaningless."
+SEED_CODE="$(create_link 'https://www.rust-lang.org')"
+if [[ -z "${SEED_CODE}" ]]; then
+  fail "could not seed a link."
 else
-  TMP_CODES="$(mktemp)"
-  TMP_STATUS="$(mktemp)"
-  trap 'rm -f "${TMP_CODES}" "${TMP_STATUS}"' EXIT
+  detail "seeded code: ${SEED_CODE}"
+  TARGET="${BASE_URL}/${SEED_CODE}"
+  curl -s -o /dev/null "${TARGET}"   # warm the cache
 
-  # Capture the HTTP status alongside the body so failures are diagnosable.
-  # Previously a failed write was simply an absent line — indistinguishable
-  # from a 429, a 500, or a dropped connection.
-  seq "${N}" | xargs -P"${CONCURRENCY}" -I{} \
-    curl -s -w '\nSTATUS:%{http_code}\n' -X POST "${BASE_URL}/shorten" \
-      -H 'content-type: application/json' \
-      -d '{"url":"https://example.com/{}"}' \
-    >> "${TMP_STATUS}" || true
+  if [[ "${ANALYTICS_AVAILABLE}" -eq 1 ]]; then
+    TP_ENQ_BEFORE="$(analytics_field enqueued)"
+    TP_DROP_BEFORE="$(analytics_field dropped)"
+    TP_ROWS_BEFORE="$(analytics_field rows_written)"
+  fi
 
-  grep -o '"code":"[^"]*"' "${TMP_STATUS}" >> "${TMP_CODES}" || true
+  run_oha "${TMP_DIR}/oha_hot.txt" -z "${LOAD_DURATION}" -c "${CONCURRENCY}" "${TARGET}"
+    # Full oha report: summary, histogram, percentile distribution,
+  # DNS+dialup details and status-code distribution.
+  sed 's/^/        /' "${TMP_DIR}/oha_hot.txt"
 
-  TOTAL="$(wc -l < "${TMP_CODES}" | tr -d ' ')"
-  UNIQUE="$(sort -u "${TMP_CODES}" | wc -l | tr -d ' ')"
-  DUPES=$(( TOTAL - UNIQUE ))
-  FAILED_WRITES=$(( N - TOTAL ))
-  SUCCESS_PCT="$(awk "BEGIN{printf \"%.2f\", 100*${TOTAL}/${N}}")"
+  # Keep a copy per mode so the sync and async reports can be compared later.
+  cp "${TMP_DIR}/oha_hot.txt" "${RESULTS_DIR}/phase4_${CLICK_MODE}_oha.txt"
 
-  COUNT_429="$(grep -c '^STATUS:429$' "${TMP_STATUS}" || true)"
-  COUNT_500="$(grep -c '^STATUS:500$' "${TMP_STATUS}" || true)"
+  detail ""
+  detail "req/s       : ${OHA_RPS}"
+  detail "p50         : ${OHA_P50} ms"
+  detail "p99         : ${OHA_P99} ms"
+  detail "DNS+dialup  : ${OHA_DIALUP} ms"
+  detail "3xx / 429   : ${OHA_3XX} / ${OHA_429}"
 
-  detail "generated codes : ${TOTAL} / ${N}  (${SUCCESS_PCT}%)"
-  detail "unique codes    : ${UNIQUE}"
-  detail "duplicates      : ${DUPES}"
-  detail "failed writes   : ${FAILED_WRITES}"
-  detail "  of which 429  : ${COUNT_429}  (rate limited)"
-  detail "  of which 500  : ${COUNT_500}  (server error)"
-
-  if [[ "${TOTAL}" -lt $(( N / 2 )) ]]; then
-    fail "only ${TOTAL}/${N} shortens succeeded — probe is not measuring what it claims."
-  elif [[ "${DUPES}" -ne 0 ]]; then
-    fail "found ${DUPES} duplicate code(s) under concurrency."
+  if [[ "${OHA_429}" -gt 0 ]]; then
+    fail "${OHA_429} responses were 429 — the throughput figure includes the limiter."
+  elif [[ "${OHA_3XX}" -eq 0 ]]; then
+    fail "no 3xx responses recorded — oha output could not be parsed or the run failed."
   else
-    pass "zero duplicate codes across ${TOTAL} concurrent shortens."
+    pass "${OHA_3XX} redirects served, none throttled."
   fi
 
-  # Any 429 here means the limiter interfered with a correctness probe.
-  if [[ "${COUNT_429}" -gt 0 ]]; then
-    fail "${COUNT_429} writes were rate limited — this probe must not be throttled."
-    detail "Restart in BENCH MODE (see script header)."
+  # Connection setup is the best available signal of host contention. Across
+  # this project's runs, throughput and DNS+dialup moved together: runs above
+  # ~7 ms dialup were environmentally handicapped.
+  if awk "BEGIN{exit !(${OHA_DIALUP} > 7)}"; then
+    warn "DNS+dialup ${OHA_DIALUP} ms — this run is likely contaminated by host contention."
+    detail "Rerun before comparing; prefer the run with the lowest dialup."
   fi
 
-  if [[ "${FAILED_WRITES}" -gt 0 ]]; then
-    FAIL_PCT="$(awk "BEGIN{printf \"%.2f\", 100*${FAILED_WRITES}/${N}}")"
-    if [[ "${FAILED_WRITES}" -gt $(( N / 20 )) ]]; then
-      fail "${FAILED_WRITES} writes failed (${FAIL_PCT}%) — above the 5% tolerance."
-    else
-      warn "${FAILED_WRITES} writes failed (${FAIL_PCT}%)."
-    fi
-    detail "With tracing now wired, read the server log for the sqlx error"
-    detail "variant: PoolTimedOut vs a unique violation are different bugs."
-    detail "  RUST_LOG=linkforge=debug,sqlx=warn just run"
-    detail "NOTE: write failures grow with table size. Run against a fresh"
-    detail "database (just db-reset) for comparable numbers."
-  fi
-fi
+  record HOT_RPS "${OHA_RPS}"
+  record HOT_P50 "${OHA_P50}"
+  record HOT_P99 "${OHA_P99}"
+  record HOT_DIALUP "${OHA_DIALUP}"
+  record HOT_REDIRECTS "${OHA_3XX}"
 
-# ===========================================================================
-# 2. THROUGHPUT: hot read path (100% cache hits)
-# ===========================================================================
-hdr "2. Throughput probe — hot read path GET /:code"
+  # --- Click pipeline accounting during the hot run ------------------------
+  if [[ "${ANALYTICS_AVAILABLE}" -eq 1 ]]; then
+    TP_ENQ=$(( $(analytics_field enqueued) - TP_ENQ_BEFORE ))
+    TP_DROP=$(( $(analytics_field dropped) - TP_DROP_BEFORE ))
+    detail ""
+    detail "clicks enqueued during run : ${TP_ENQ}"
+    detail "clicks dropped during run  : ${TP_DROP}"
 
-if [[ "${BENCH_MODE}" -eq 0 ]]; then
-  skipped "rate limiter active; throughput would measure the limiter."
-else
-  SEED_CODE="$(create_link 'https://www.rust-lang.org')"
-
-  if [[ -z "${SEED_CODE}" ]]; then
-    fail "could not seed a link for the throughput probe."
-  elif ! guard_not_throttled "throughput probe"; then
-    : # guard already recorded the failure
-  else
-    detail "seeded code: ${SEED_CODE}"
-    TARGET_URL="${BASE_URL}/${SEED_CODE}"
-
-    # Warm the cache so this measures the hit path, not a cold start.
-    curl -s -o /dev/null "${TARGET_URL}"
-
-    if command -v oha >/dev/null 2>&1; then
-      info "  oha: ${LOAD_DURATION}, c=${CONCURRENCY}, keepalive on"
-      oha -z "${LOAD_DURATION}" -c "${CONCURRENCY}" --no-tui "${TARGET_URL}"
-
-      # Post-check: did the limiter engage DURING the run? oha's own status
-      # distribution is printed above, but we assert explicitly here so a
-      # 429-dominated run cannot be mistaken for a throughput result.
-      if is_throttled; then
-        fail "server is rate limiting immediately after the load run."
-        detail "The throughput figure above includes 429 responses and is invalid."
-        detail "Check oha's status distribution: it should be 100% 3xx."
+    # Every redirect should produce exactly one click attempt (enqueued or
+    # dropped). A large gap means clicks are not being emitted on some path.
+    ATTEMPTS=$(( TP_ENQ + TP_DROP ))
+    if [[ "${CLICK_MODE}" == "async" ]]; then
+      if [[ "${ATTEMPTS}" -lt $(( OHA_3XX * 95 / 100 )) ]]; then
+        fail "only ${ATTEMPTS} click attempts for ${OHA_3XX} redirects."
+        detail "Some successful redirect path is not calling clicks.record()."
+        detail "Check all three success paths: cache hit, waiter, leader."
       else
-        pass "no throttling detected around the throughput run."
+        pass "every redirect emitted a click (${ATTEMPTS} attempts / ${OHA_3XX} redirects)."
       fi
-    elif command -v wrk >/dev/null 2>&1; then
-      info "  wrk: ${LOAD_DURATION}, c=${CONCURRENCY}"
-      wrk -t4 -c"${CONCURRENCY}" -d"${LOAD_DURATION}" "${TARGET_URL}"
-    else
-      skipped "neither 'oha' nor 'wrk' found. Install: cargo install oha"
-    fi
 
-    warn "Interpretation: the load generator shares this host with the server."
-    detail "Throughput here is environment-bound, not application-bound."
-    detail "Phase 3 adds per-request tracing, which costs real CPU — expect a"
-    detail "measurable drop vs the Phase 2 baseline. That is a tradeoff, not"
-    detail "a regression. Compare only runs on identical hardware, and treat"
-    detail "~2% run-to-run variance as the noise floor."
+      if [[ "${TP_DROP}" -gt 0 ]]; then
+        DROP_PCT="$(awk "BEGIN{printf \"%.3f\", 100*${TP_DROP}/(${ATTEMPTS}>0?${ATTEMPTS}:1)}")"
+        warn "${TP_DROP} clicks dropped (${DROP_PCT}%) — backpressure engaged."
+        detail "This is the documented drop-on-full policy working, not a bug."
+        detail "Undercounting is the deliberate price of a fast redirect path."
+        record HOT_DROP_PCT "${DROP_PCT}"
+      else
+        pass "zero clicks dropped at ${OHA_RPS} req/s — the writer kept up."
+        record HOT_DROP_PCT 0
+      fi
+    fi
+    record HOT_CLICKS_ENQUEUED "${TP_ENQ}"
+    record HOT_CLICKS_DROPPED "${TP_DROP}"
   fi
+fi
 fi
 
 # ===========================================================================
-# 3. NEGATIVE CACHING: repeated 404s must stop reaching Postgres
+# 3. NEGATIVE CACHING — repeated 404s stop reaching Postgres
 # ===========================================================================
-hdr "3. Negative caching probe — ${NEG_PROBE_REQUESTS} repeat 404s"
+if should_run 3; then
+hdr "3. Negative caching — ${NEG_PROBE_REQUESTS} repeat 404s"
 
 if [[ "${STATS_AVAILABLE}" -eq 0 ]]; then
   skipped "no /debug/cache."
-elif [[ "${BENCH_MODE}" -eq 0 ]]; then
-  skipped "rate limiter active; repeat requests would be rejected, not cached."
 else
-  MISSING_CODE="$(random_valid_code)"
-  detail "probe code: ${MISSING_CODE} (${#MISSING_CODE} chars, base62)"
+  MISSING="$(random_valid_code)"
+  if [[ "$(http_code "${BASE_URL}/${MISSING}")" != "404" ]]; then
+    fail "probe code ${MISSING} did not 404 — cannot establish precondition."
+  else
+    invalidate "${MISSING}" || true
+    B_MISS="$(stat_field misses)"; B_NEG="$(stat_field negative_hits)"; B_DB="$(stat_field db_queries)"
+    ST="$(http_code "${BASE_URL}/${MISSING}")"
+    F_MISS=$(( $(stat_field misses) - B_MISS ))
+    F_DB=$(( $(stat_field db_queries) - B_DB ))
+    A_DB_FIRST="$(stat_field db_queries)"
 
-  if assert_well_formed "${MISSING_CODE}" "negative-cache probe"; then
-    invalidate "${MISSING_CODE}" || true
+    seq "${NEG_PROBE_REQUESTS}" | xargs -P50 -I{} curl -s -o /dev/null "${BASE_URL}/${MISSING}"
 
-    BEFORE_MISS="$(stat_field misses)"
-    BEFORE_NEG="$(stat_field negative_hits)"
-    BEFORE_DB="$(stat_field db_queries)"
+    R_DB=$(( $(stat_field db_queries) - A_DB_FIRST ))
+    NEG=$(( $(stat_field negative_hits) - B_NEG ))
 
-    STATUS="$(http_code "${BASE_URL}/${MISSING_CODE}")"
-    AFTER_FIRST_MISS="$(stat_field misses)"
-    AFTER_FIRST_DB="$(stat_field db_queries)"
+    detail "1st: status ${ST}, misses +${F_MISS}, db +${F_DB}"
+    detail "next ${NEG_PROBE_REQUESTS}: db +${R_DB}, negative hits +${NEG}"
 
-    FIRST_MISS_DELTA=$(( AFTER_FIRST_MISS - BEFORE_MISS ))
-    FIRST_DB_DELTA=$(( AFTER_FIRST_DB - BEFORE_DB ))
-
-    seq "${NEG_PROBE_REQUESTS}" \
-      | xargs -P50 -I{} curl -s -o /dev/null "${BASE_URL}/${MISSING_CODE}"
-
-    AFTER_ALL_MISS="$(stat_field misses)"
-    AFTER_ALL_NEG="$(stat_field negative_hits)"
-    AFTER_ALL_DB="$(stat_field db_queries)"
-
-    REST_DB_DELTA=$(( AFTER_ALL_DB - AFTER_FIRST_DB ))
-    NEG_DELTA=$(( AFTER_ALL_NEG - BEFORE_NEG ))
-    NEG_THRESHOLD=$(( NEG_PROBE_REQUESTS * 8 / 10 ))
-
-    detail "status of 1st request      : ${STATUS}  (expect 404)"
-    detail "cache misses, 1st request  : ${FIRST_MISS_DELTA}  (expect 1)"
-    detail "DB queries,   1st request  : ${FIRST_DB_DELTA}  (expect 1)"
-    detail "DB queries,   next ${NEG_PROBE_REQUESTS}     : ${REST_DB_DELTA}  (expect 0)"
-    detail "negative hits recorded     : ${NEG_DELTA}  (expect ~${NEG_PROBE_REQUESTS})"
-
-    if [[ "${STATUS}" == "429" ]]; then
-      fail "probe was rate limited; negative caching was never exercised."
-    elif [[ "${STATUS}" != "404" ]]; then
-      fail "expected 404 for a nonexistent code, got ${STATUS}."
-    elif [[ "${FIRST_MISS_DELTA}" -lt 1 ]]; then
-      fail "first request caused no cache miss — requests are not reaching the cache."
-      detail "Domain validation is likely rejecting the code before lookup."
-    elif [[ "${FIRST_DB_DELTA}" -lt 1 ]]; then
-      fail "first request caused no DB query — is db_queries wired up?"
-      detail "Check query_count() is on the LinkRepository trait impl, not an"
-      detail "inherent impl: through Arc<dyn Trait> the default body returns 0."
-    elif [[ "${NEG_DELTA}" -lt "${NEG_THRESHOLD}" ]]; then
-      fail "only ${NEG_DELTA} negative hits for ${NEG_PROBE_REQUESTS} requests."
-      detail "Negative caching is not engaging as expected."
-    elif [[ "${REST_DB_DELTA}" -ne 0 ]]; then
-      fail "${REST_DB_DELTA} repeat 404s still reached the database."
-      detail "Is negative_ttl_secs shorter than this probe's runtime?"
+    if [[ "${F_MISS}" -lt 1 || "${F_DB}" -lt 1 ]]; then
+      fail "first request caused no miss/DB query — the probe exercised nothing."
+    elif [[ "${NEG}" -lt $(( NEG_PROBE_REQUESTS * 8 / 10 )) ]]; then
+      fail "only ${NEG} negative hits for ${NEG_PROBE_REQUESTS} requests."
+    elif [[ "${R_DB}" -ne 0 ]]; then
+      fail "${R_DB} repeat 404s still reached the database."
     else
-      pass "${NEG_PROBE_REQUESTS} repeat 404s absorbed; exactly ${FIRST_DB_DELTA} DB query."
+      pass "${NEG_PROBE_REQUESTS} repeat 404s absorbed with 0 DB queries."
     fi
 
-    NEG_HIT_S="$(http_time "${BASE_URL}/${MISSING_CODE}")"
-    COLD_S="$(http_time "${BASE_URL}/$(random_valid_code)")"
-    detail "negative-cache hit : ${NEG_HIT_S}s"
-    detail "cold 404 (DB)      : ${COLD_S}s"
-    warn "End-to-end curl timings are dominated by TCP + process cost."
-    detail "The true ${BENCH_HIT_NS}ns vs ${BENCH_MISS_NS}ns gap is only"
-    detail "visible in cargo bench, never through curl."
+    # Phase 4 addition: 404s must NOT produce clicks. Otherwise a scanner
+    # writes analytics rows for links that do not exist, bypassing the
+    # protection negative caching provides.
+    if [[ "${ANALYTICS_AVAILABLE}" -eq 1 ]]; then
+      E_BEFORE="$(analytics_field enqueued)"; D_BEFORE="$(analytics_field dropped)"
+      seq 100 | xargs -P20 -I{} curl -s -o /dev/null "${BASE_URL}/${MISSING}"
+      E_DELTA=$(( $(analytics_field enqueued) - E_BEFORE + $(analytics_field dropped) - D_BEFORE ))
+      if [[ "${E_DELTA}" -gt 0 ]]; then
+        fail "100 404s produced ${E_DELTA} click attempts — misses must not be recorded."
+      else
+        pass "404s produce no click events."
+      fi
+    fi
   fi
+fi
 fi
 
 # ===========================================================================
-# 4. SINGLE-FLIGHT: concurrent misses must collapse into one DB query
+# 4. SINGLE-FLIGHT — concurrent misses collapse into one DB query
 # ===========================================================================
-hdr "4. Single-flight probe — ${SF_PROBE_REQUESTS} concurrent misses, one cold code"
+if should_run 4; then
+hdr "4. Single-flight — ${SF_PROBE_REQUESTS} concurrent misses on one cold code"
 
 if [[ "${STATS_AVAILABLE}" -eq 0 ]]; then
   skipped "no /debug/cache."
-elif [[ "${BENCH_MODE}" -eq 0 ]]; then
-  skipped "rate limiter active; concurrent misses would be rejected, not coalesced."
 else
-  SF_CODE="$(create_link 'https://singleflight.example/')"
-
-  if [[ -z "${SF_CODE}" ]]; then
-    fail "could not create a link for the single-flight probe."
-  elif ! invalidate "${SF_CODE}"; then
-    fail "invalidate endpoint failed — cannot make the code cold."
-    detail "Without a cold code this probe measures cache HITS, not misses."
+  SF="$(create_link 'https://singleflight.example/')"
+  if [[ -z "${SF}" ]] || ! invalidate "${SF}"; then
+    fail "could not create + invalidate a cold code."
   else
-    detail "probe code: ${SF_CODE}"
-
-    # --- VERIFY the precondition: one request must register a cache miss ---
-    PRE_MISS="$(stat_field misses)"
-    curl -s -o /dev/null "${BASE_URL}/${SF_CODE}"
-    POST_MISS="$(stat_field misses)"
-
-    if [[ $(( POST_MISS - PRE_MISS )) -lt 1 ]]; then
-      fail "code is still cached after invalidate — probe would measure hits."
-      detail "Verify POST /debug/cache/invalidate actually removes the entry."
+    PRE="$(stat_field misses)"; curl -s -o /dev/null "${BASE_URL}/${SF}"
+    if [[ $(( $(stat_field misses) - PRE )) -lt 1 ]]; then
+      fail "code still cached after invalidate — probe would measure hits."
     else
-      invalidate "${SF_CODE}"
-
-      SF_DB_BEFORE="$(stat_field db_queries)"
-      SF_MISS_BEFORE="$(stat_field misses)"
-
-      detail "firing ${SF_PROBE_REQUESTS} requests @ concurrency ${SF_PROBE_REQUESTS}"
-      fire_concurrent "${BASE_URL}/${SF_CODE}" "${SF_PROBE_REQUESTS}"
-
-      SF_DB_AFTER="$(stat_field db_queries)"
-      SF_MISS_AFTER="$(stat_field misses)"
-
-      DB_DELTA=$(( SF_DB_AFTER - SF_DB_BEFORE ))
-      MISS_DELTA=$(( SF_MISS_AFTER - SF_MISS_BEFORE ))
-
-      detail "requests fired : ${SF_PROBE_REQUESTS}"
-      detail "cache misses   : ${MISS_DELTA}   (requests that found no entry)"
-      detail "DB queries     : ${DB_DELTA}   (expect ~1 if coalescing works)"
-
-      # THE KEY DISTINCTION: every request checks the cache BEFORE reaching the
-      # inflight registry, so MISS_DELTA counts would-be DB queries while
-      # DB_DELTA counts actual ones. Single-flight exists to make them diverge.
-      if [[ "${MISS_DELTA}" -lt 1 ]]; then
-        fail "zero cache misses — the code was not cold; probe is invalid."
-      elif [[ "${DB_DELTA}" -lt 1 ]]; then
-        fail "zero DB queries for ${MISS_DELTA} cache misses — is db_queries wired up?"
+      invalidate "${SF}"
+      DB0="$(stat_field db_queries)"; M0="$(stat_field misses)"
+      oha -n "${SF_PROBE_REQUESTS}" -c "${SF_PROBE_REQUESTS}" --no-tui \
+        "${BASE_URL}/${SF}" >/dev/null 2>&1 || true
+      DBD=$(( $(stat_field db_queries) - DB0 )); MD=$(( $(stat_field misses) - M0 ))
+      detail "cache misses : ${MD}   DB queries : ${DBD}"
+      if [[ "${MD}" -lt 1 ]]; then
+        fail "zero misses — the code was not cold."
+      elif [[ "${DBD}" -lt 1 ]]; then
+        fail "zero DB queries — is db_queries wired to the trait impl?"
+      elif [[ "${DBD}" -le 3 ]]; then
+        pass "${MD} concurrent misses collapsed into ${DBD} DB quer(ies)."
+      elif [[ "${DBD}" -le 20 ]]; then
+        warn "PARTIAL coalescing: ${DBD} queries for ${MD} misses."
       else
-        COALESCE_RATIO="$(awk "BEGIN{printf \"%.1f\", ${MISS_DELTA}/${DB_DELTA}}")"
-        detail "coalescing ratio : ${COALESCE_RATIO}x"
-
-        if [[ "${DB_DELTA}" -le 3 ]]; then
-          pass "${MISS_DELTA} concurrent misses collapsed into ${DB_DELTA} DB quer(ies)."
-          detail "Without single-flight this would be ${MISS_DELTA}."
-        elif [[ "${DB_DELTA}" -le 20 ]]; then
-          warn "PARTIAL: ${DB_DELTA} DB queries for ${MISS_DELTA} cache misses."
-          detail "Coalescing works, but flights did not fully overlap."
-          detail "Expected when the leader completes before later arrivals."
-        else
-          fail "${DB_DELTA} DB queries for ${MISS_DELTA} cache misses — little coalescing."
-          detail "Check the inflight registry: is the lock released before the"
-          detail "DB call, and deregistration done BEFORE broadcasting?"
-        fi
+        fail "${DBD} queries for ${MD} misses — little coalescing."
       fi
-      detail "NOTE: the ratio is not a constant. It depends on how long the"
-      detail "leader's query takes relative to arrival rate — a warm DB yields"
-      detail "a lower ratio because fewer requests arrive mid-flight."
     fi
   fi
 fi
+fi
 
 # ===========================================================================
-# 5. REQUEST ID PROPAGATION  (Phase 3 acceptance criterion)
-#
-# "logs correlate a request across middleware and handler"
-#
-# The observable half of that is the response header: a supplied x-request-id
-# must be echoed back, and an absent one must be generated. Log correlation
-# itself must be eyeballed in the server output — the script prints the ID to
-# grep for.
+# 5. REQUEST ID PROPAGATION
 # ===========================================================================
+if should_run 5; then
 hdr "5. Request ID propagation"
 
-# --- 5a. A client-supplied ID must be echoed unchanged ---------------------
-SUPPLIED_ID="loadtest-$(date +%s)-$$"
-ECHOED_ID="$(
-  curl -s -D - -o /dev/null -H "x-request-id: ${SUPPLIED_ID}" \
-    "${BASE_URL}/health" \
-  | grep -i '^x-request-id:' | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r'
-)"
+hdr_id() {
+  curl -s -D - -o /dev/null "$@" | grep -i '^x-request-id:' | head -n1 \
+    | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r'
+}
 
-detail "sent     x-request-id: ${SUPPLIED_ID}"
-detail "received x-request-id: ${ECHOED_ID:-<none>}"
+SUP="loadtest-$(date +%s)-$$"
+ECHO="$(hdr_id -H "x-request-id: ${SUP}" "${BASE_URL}/health")"
+G1="$(hdr_id "${BASE_URL}/health")"; G2="$(hdr_id "${BASE_URL}/health")"
+ERR="$(hdr_id "${BASE_URL}/$(random_valid_code)")"
+STATS_ID="$(hdr_id "${BASE_URL}/$(random_valid_code)/stats")"
 
-if [[ -z "${ECHOED_ID}" ]]; then
-  fail "no x-request-id on the response."
-  detail "Is PropagateRequestIdLayer in the middleware stack?"
-elif [[ "${ECHOED_ID}" != "${SUPPLIED_ID}" ]]; then
-  fail "x-request-id was not preserved (got '${ECHOED_ID}')."
-  detail "SetRequestIdLayer should only generate one when absent."
-else
-  pass "client-supplied x-request-id echoed unchanged."
+[[ "${ECHO}" == "${SUP}" ]] && pass "supplied id echoed." || fail "supplied id not echoed (got '${ECHO}')."
+[[ -n "${G1}" ]] && pass "id generated when absent." || fail "no id generated."
+[[ -n "${G1}" && "${G1}" != "${G2}" ]] && pass "generated ids distinct." || fail "generated ids not distinct."
+[[ -n "${ERR}" ]] && pass "404 carries x-request-id." || warn "404 has no x-request-id."
+[[ -n "${STATS_ID}" ]] && pass "/stats responses carry x-request-id." || warn "/stats has no x-request-id."
 fi
-
-# --- 5b. An absent ID must be generated ------------------------------------
-GENERATED_ID="$(
-  curl -s -D - -o /dev/null "${BASE_URL}/health" \
-  | grep -i '^x-request-id:' | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r'
-)"
-
-detail "generated id (no header sent): ${GENERATED_ID:-<none>}"
-
-if [[ -z "${GENERATED_ID}" ]]; then
-  fail "no x-request-id generated when the client did not supply one."
-  detail "Is SetRequestIdLayer::x_request_id(MakeRequestUuid) wired up?"
-elif [[ "${GENERATED_ID}" == "${SUPPLIED_ID}" ]]; then
-  fail "generated id equals the previously supplied id — IDs are not unique."
-else
-  pass "an x-request-id was generated for a request that omitted it."
-fi
-
-# --- 5c. Two requests must get distinct generated IDs ----------------------
-SECOND_ID="$(
-  curl -s -D - -o /dev/null "${BASE_URL}/health" \
-  | grep -i '^x-request-id:' | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r'
-)"
-
-if [[ -n "${GENERATED_ID}" && "${GENERATED_ID}" == "${SECOND_ID}" ]]; then
-  fail "two requests received the SAME generated id — correlation is impossible."
-else
-  pass "generated ids are distinct across requests."
-fi
-
-# --- 5d. Log correlation: give the operator something to grep --------------
-CORRELATE_ID="correlate-$(date +%s)-$$"
-curl -s -o /dev/null -H "x-request-id: ${CORRELATE_ID}" \
-  "${BASE_URL}/$(random_valid_code)"
-
-info "  Manual check — log correlation across middleware AND handler:"
-detail "In the server output, this single id should appear on BOTH the"
-detail "middleware span and the handler's own events:"
-detail ""
-detail "    grep '${CORRELATE_ID}' <server log>"
-detail ""
-detail "A script cannot verify this without scraping stdout, which couples the"
-detail "harness to log formatting. Verify it once by eye, then rely on the"
-detail "header assertions above as the regression guard."
 
 # ===========================================================================
-# 6. RATE LIMITING  (Phase 3 acceptance criterion)
+# 6. RATE LIMITING — only meaningful against a small bucket
 #
-# "exceeding the rate returns 429"
-#
-# This is the ONE probe that WANTS to be throttled. It runs last so the
-# buckets it drains cannot affect any measurement probe.
-#
-# It requires a server whose bucket is small enough to trip within
-# RL_PROBE_REQUESTS. In BENCH MODE the bucket is deliberately enormous, so
-# this probe will correctly report that it could not exercise the limiter —
-# which is a SKIP, not a pass.
+# In bench mode this is a SKIP, never a pass. The authoritative check is the
+# integration test plus a manual run with RATE_LIMIT_REQUESTS=5.
 # ===========================================================================
-hdr "6. Rate limiting — per-IP 429"
-
-detail "firing ${RL_PROBE_REQUESTS} rapid sequential requests at /health"
-
-RL_STATUSES="$(fire_sequential_statuses "${BASE_URL}/health" "${RL_PROBE_REQUESTS}")"
-RL_200="$(grep -c '^200$' <<<"${RL_STATUSES}" || true)"
-RL_429="$(grep -c '^429$' <<<"${RL_STATUSES}" || true)"
-RL_OTHER=$(( RL_PROBE_REQUESTS - RL_200 - RL_429 ))
-
-detail "200 OK            : ${RL_200}"
-detail "429 Too Many Reqs : ${RL_429}"
-detail "other             : ${RL_OTHER}"
-
-if [[ "${RL_429}" -eq 0 ]]; then
-  if [[ "${BENCH_MODE}" -eq 1 ]]; then
-    # Expected in bench mode. Report honestly rather than passing vacuously.
-    skipped "no 429 in ${RL_PROBE_REQUESTS} requests — bucket is benchmark-sized."
-    detail "This does NOT prove the limiter works. Verify it separately:"
-    detail "  LINKFORGE__RATE_LIMIT__REQUESTS=5 \\"
-    detail "  LINKFORGE__RATE_LIMIT__WINDOW_SECS=60 just run"
-    detail "  ./scripts/load_test.sh   # probe 6 should then report 429s"
-    detail "The integration test exceeding_the_bucket_returns_429 is the"
-    detail "authoritative check; this probe is a smoke test."
-  else
-    fail "limiter engaged during pre-flight but produced no 429 here."
-    detail "Inconsistent behaviour — investigate the bucket refill math."
-  fi
-else
-  pass "limiter returned ${RL_429} × 429 after ${RL_200} allowed requests."
-
-  # --- Verify the 429 response is well-formed ------------------------------
-  RL_HEADERS="$(curl -s -D - -o /dev/null "${BASE_URL}/health")"
-  RL_STATUS_LINE="$(head -n1 <<<"${RL_HEADERS}" | tr -d '\r')"
-
-  if grep -qi '^retry-after:' <<<"${RL_HEADERS}"; then
-    RETRY_AFTER="$(grep -i '^retry-after:' <<<"${RL_HEADERS}" \
-                  | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')"
-    pass "429 carries retry-after: ${RETRY_AFTER}"
-  else
-    # Not fatal, but a 429 without retry-after gives clients no backoff signal.
-    warn "429 response has no retry-after header."
-    detail "Clients have no guidance on when to retry. Status line: ${RL_STATUS_LINE}"
-    detail "Check the header name is hyphenated ('retry-after'), not underscored."
-  fi
-
-  # --- Verify recovery: tokens must refill ---------------------------------
-  detail "waiting 3s to confirm the bucket refills..."
-  sleep 3
-  RECOVERED="$(http_code "${BASE_URL}/health")"
-  detail "status after 3s idle: ${RECOVERED}"
-
-  if [[ "${RECOVERED}" == "429" ]]; then
-    warn "still throttled after 3s — refill rate may be very low."
-    detail "Expected if window_secs is large. Not necessarily a bug."
-  else
-    pass "bucket refilled; requests are accepted again."
-  fi
+if should_run 6; then
+hdr "6. Rate limiting"
+skipped "bench-mode bucket is untrippable by design."
+detail "Verify separately:"
+detail "  RATE_LIMIT_REQUESTS=5 RATE_LIMIT_WINDOW_SECS=60 cargo run --release"
+detail "  for i in \$(seq 10); do curl -s -o /dev/null -w '%{http_code} ' localhost:3000/health; done"
+detail "  expect: 200 x5 then 429 x5"
 fi
 
 # ===========================================================================
-# 7. CACHE STATISTICS SUMMARY
+# 7. STATS ENDPOINT CONTRACT  (Phase 4)
+#
+# GET /:code/stats is new surface area. Pin its contract before anything
+# depends on it.
 # ===========================================================================
-hdr "7. Cache statistics (cumulative over this run)"
+if should_run 7; then
+hdr "7. Stats endpoint contract — GET /:code/stats"
 
-if [[ "${STATS_AVAILABLE}" -eq 0 ]]; then
-  skipped "no /debug/cache."
+FRESH="$(create_link 'https://stats-contract.example/')"
+if [[ -z "${FRESH}" ]]; then
+  fail "could not create a link for the stats contract probe."
 else
-  HITS="$(stat_field hits)"
-  NEG="$(stat_field negative_hits)"
-  MISS="$(stat_field misses)"
-  DBQ="$(stat_field db_queries)"
-  TOTAL_LOOKUPS=$(( HITS + NEG + MISS ))
+  BODY="$(curl -s "${BASE_URL}/${FRESH}/stats")"
+  STAT="$(http_code "${BASE_URL}/${FRESH}/stats")"
+  CT="$(curl -s -D - -o /dev/null "${BASE_URL}/${FRESH}/stats" | grep -i '^content-type:' | tr -d '\r')"
+  detail "existing, never clicked -> ${STAT} ${BODY}"
 
-  if [[ "${TOTAL_LOOKUPS}" -eq 0 ]]; then
-    fail "no cache lookups recorded across the entire run."
-    detail "Every request was rejected before reaching the cache."
+  [[ "${STAT}" == "200" ]] && pass "existing link -> 200." || fail "existing link -> ${STAT}, expected 200."
+  grep -qi 'application/json' <<<"${CT}" && pass "content-type is JSON." || fail "content-type is not JSON (${CT})."
+  grep -q "\"code\":\"${FRESH}\"" <<<"${BODY}" && pass "body echoes the code." || fail "body does not contain code=${FRESH}."
+  grep -qE '"clicks":0([,}])' <<<"${BODY}" \
+    && pass "never-clicked link reports clicks=0." \
+    || fail "never-clicked link does not report clicks=0: ${BODY}"
+
+  S_UNKNOWN="$(http_code "${BASE_URL}/$(random_valid_code)/stats")"
+  [[ "${S_UNKNOWN}" == "404" ]] \
+    && pass "unknown code -> 404 (not clicks=0)." \
+    || fail "unknown code -> ${S_UNKNOWN}; a nonexistent link must 404, not report 0."
+
+  S_BAD="$(http_code "${BASE_URL}/has_underscore/stats")"
+  [[ "${S_BAD}" == "404" || "${S_BAD}" == "400" ]] \
+    && pass "malformed code -> ${S_BAD}." \
+    || fail "malformed code -> ${S_BAD}."
+
+  # Reading stats must not itself be counted as a click.
+  B="$(stats_clicks "${FRESH}")"
+  for _ in $(seq 20); do curl -s -o /dev/null "${BASE_URL}/${FRESH}/stats"; done
+  sleep 0.5
+  A="$(stats_clicks "${FRESH}")"
+  [[ "${A}" -eq "${B}" ]] \
+    && pass "reading /stats does not record clicks." \
+    || fail "20 /stats reads changed the click count ${B} -> ${A}."
+
+  # /stats must not consume the redirect path's cache in a way that breaks it.
+  RD="$(http_code "${BASE_URL}/${FRESH}")"
+  [[ "${RD}" =~ ^3 ]] && pass "redirect still works after /stats reads." || fail "redirect broken after /stats (${RD})."
+fi
+fi
+
+# ===========================================================================
+# 8. CLICK ACCOUNTING — no loss under normal load  (Phase 4)
+#
+# Fire a known number of redirects at a FRESH code below the channel's
+# capacity, then poll the public stats endpoint until the count settles.
+#
+# In async mode the expected count is (redirects - dropped). Under normal
+# load dropped should be 0, so stats must equal the redirect count exactly.
+# A shortfall with zero drops means clicks are being LOST SILENTLY — the
+# worst outcome, because the drop counter is the only loss we accept.
+# ===========================================================================
+if should_run 8; then
+hdr "8. Click accounting — ${CLICK_PROBE_REQUESTS} redirects, exact count"
+
+CODE8="$(create_link "https://click-accounting.example/$(date +%s)")"
+if [[ -z "${CODE8}" ]]; then
+  fail "could not create a link."
+else
+  BEFORE8="$(stats_clicks "${CODE8}")"
+  if [[ "${BEFORE8}" -ne 0 ]]; then
+    fail "fresh link already reports ${BEFORE8} clicks — precondition broken."
   else
-    RATIO="$(awk "BEGIN{printf \"%.4f\", (${HITS}+${NEG})/${TOTAL_LOOKUPS}}")"
-    PCT="$(awk   "BEGIN{printf \"%.2f\", 100*(${HITS}+${NEG})/${TOTAL_LOOKUPS}}")"
+    [[ "${ANALYTICS_AVAILABLE}" -eq 1 ]] && D8_BEFORE="$(analytics_field dropped)"
 
-    detail "positive hits : ${HITS}"
-    detail "negative hits : ${NEG}"
-    detail "cache misses  : ${MISS}"
-    detail "DB queries    : ${DBQ}"
-    detail "total lookups : ${TOTAL_LOOKUPS}"
-    green  "    HIT RATIO : ${PCT}%  (${RATIO})"
+    # oha at moderate concurrency, exact request count. Count the 3xx it got,
+    # because only SUCCESSFUL redirects record clicks.
+    run_oha "${TMP_DIR}/oha_clicks.txt" -n "${CLICK_PROBE_REQUESTS}" -c 50 "${BASE_URL}/${CODE8}"
+    SERVED="${OHA_3XX}"
 
-    # Anti-vacuity at the run level.
-    if [[ "${BENCH_MODE}" -eq 1 && "${NEG}" -eq 0 && "${MISS}" -eq 0 ]]; then
-      fail "100% positive hits, zero misses and zero negative hits."
-      detail "The cache-aware probes did not exercise their code paths."
+    D8=0
+    [[ "${ANALYTICS_AVAILABLE}" -eq 1 ]] && D8=$(( $(analytics_field dropped) - D8_BEFORE ))
+    EXPECTED=$(( SERVED - D8 ))
+
+    detail "redirects served : ${SERVED}"
+    detail "clicks dropped   : ${D8}"
+    detail "expected in DB   : ${EXPECTED}"
+
+    t0="$(date +%s%N)"
+    if GOT="$(wait_for_clicks "${CODE8}" "${EXPECTED}" "${CLICK_SETTLE_TIMEOUT_S}")"; then
+      SETTLE_MS=$(( ( $(date +%s%N) - t0 ) / 1000000 ))
+      detail "stats reports    : ${GOT}   (settled in ${SETTLE_MS} ms)"
+      if [[ "${GOT}" -eq "${EXPECTED}" ]]; then
+        pass "exact: ${GOT} clicks persisted for ${SERVED} redirects (${D8} dropped)."
+      else
+        fail "OVERCOUNT: ${GOT} clicks for ${EXPECTED} expected — duplicate writes?"
+        detail "Check that a failed batch is not retried AND logged as written."
+      fi
+      record CLICK_SETTLE_MS "${SETTLE_MS}"
+    else
+      detail "stats reports    : ${GOT} after ${CLICK_SETTLE_TIMEOUT_S}s"
+      LOST=$(( EXPECTED - GOT ))
+      fail "SILENT LOSS: ${LOST} clicks neither persisted nor counted as dropped."
+      detail "The drop counter is the only loss the design accepts. Likely causes:"
+      detail "  * a failed insert_batch (check server log: 'click batch insert failed')"
+      detail "  * the writer task panicked or exited"
+      detail "  * clicks emitted on fewer success paths than redirects served"
     fi
 
-    if [[ "${MISS}" -gt 0 && "${DBQ}" -gt 0 ]]; then
-      OVERALL_COALESCE="$(awk "BEGIN{printf \"%.2f\", ${MISS}/${DBQ}}")"
-      detail "overall coalescing: ${OVERALL_COALESCE} cache misses per DB query"
+    # Staleness bound: async mode trades freshness for throughput. The
+    # settle time should be on the order of batch_wait_ms, not seconds.
+    if [[ "${CLICK_MODE}" == "async" && -n "${SETTLE_MS:-}" && "${SETTLE_MS}" -gt 2000 ]]; then
+      warn "clicks took ${SETTLE_MS} ms to become visible."
+      detail "Expected roughly batch_wait_ms + one insert. Is the writer backlogged?"
     fi
-
-    EXPECTED_NS="$(awk "BEGIN{printf \"%.0f\", ${RATIO}*${BENCH_HIT_NS} + (1-${RATIO})*${BENCH_MISS_NS}}")"
-    detail "expected cost/lookup : ~${EXPECTED_NS} ns"
-    detail "  E[cost] = r*${BENCH_HIT_NS}ns + (1-r)*${BENCH_MISS_NS}ns   (from cargo bench)"
-    detail "  Note how nonlinear this is: small ratio drops are expensive."
-
-    warn "These are CUMULATIVE counters, not a rate."
-    detail "They describe the whole process lifetime and converge over time,"
-    detail "hiding transient spikes. Prometheus rate() over a window is the"
-    detail "correct production form (Phase 5)."
   fi
+fi
+fi
+
+# ===========================================================================
+# 9. WRITER HEALTH & BATCHING EFFECTIVENESS  (Phase 4)
+#
+# Batching is the whole reason the writer is cheap. If rows_written/batches
+# is ~1, every click is its own INSERT and the design is buying nothing.
+# ===========================================================================
+if should_run 9; then
+hdr "9. Writer health & batching effectiveness"
+
+if [[ "${ANALYTICS_AVAILABLE}" -eq 0 ]]; then
+  skipped "no /debug/analytics."
+elif [[ "${CLICK_MODE}" == "sync" ]]; then
+  skipped "sync mode has no writer task."
+else
+  BATCHES="$(analytics_field batches)"
+  ROWS="$(analytics_field rows_written)"
+  FAILED="$(analytics_field failed_batches)"
+  DEPTH="$(analytics_field queue_depth)"
+  ENQ="$(analytics_field enqueued)"
+  DROP="$(analytics_field dropped)"
+
+  detail "enqueued       : ${ENQ}"
+  detail "dropped        : ${DROP}"
+  detail "batches        : ${BATCHES}"
+  detail "rows written   : ${ROWS}"
+  detail "failed batches : ${FAILED}"
+  detail "queue depth    : ${DEPTH}  (now, after load)"
+
+  if [[ "${BATCHES}" -eq 0 ]]; then
+    fail "the writer has flushed zero batches — it is not running."
+  else
+    AVG="$(awk "BEGIN{printf \"%.1f\", ${ROWS}/${BATCHES}}")"
+    detail "avg batch size : ${AVG} rows"
+    record AVG_BATCH "${AVG}"
+    if awk "BEGIN{exit !(${AVG} < 2)}"; then
+      warn "average batch is ${AVG} rows — batching is not happening."
+      detail "Each click is effectively its own INSERT. Under this load the"
+      detail "writer should accumulate many rows per flush."
+    else
+      pass "batching effective: ~${AVG} rows per INSERT."
+    fi
+  fi
+
+  [[ "${FAILED}" -gt 0 ]] \
+    && fail "${FAILED} batch insert(s) failed — those clicks were lost." \
+    || pass "no failed batch inserts."
+
+  # Conservation: everything enqueued is either written, still queued, or in
+  # a failed batch. A gap means rows vanished between channel and DB.
+  sleep 1
+  ROWS="$(analytics_field rows_written)"; DEPTH="$(analytics_field queue_depth)"
+  IN_FLIGHT_MAX="$(analytics_field max_batch)"; IN_FLIGHT_MAX="${IN_FLIGHT_MAX:-500}"
+  GAP=$(( ENQ - ROWS - DEPTH ))
+  detail "conservation gap (enqueued - written - queued): ${GAP}"
+  if [[ "${GAP}" -lt 0 ]]; then
+    fail "more rows written than enqueued (${GAP}) — counters disagree."
+  elif [[ "${GAP}" -gt "${IN_FLIGHT_MAX}" && "${FAILED}" -eq 0 ]]; then
+    fail "${GAP} clicks unaccounted for with no failed batches."
+  else
+    pass "click conservation holds (gap ${GAP} ≤ one in-flight batch)."
+  fi
+
+  [[ "${DEPTH}" -gt 0 ]] \
+    && warn "queue depth ${DEPTH} after load — the writer is still draining." \
+    || pass "queue fully drained after load."
+fi
+fi
+
+# ===========================================================================
+# 10. PHASE 4 VERDICT — async vs sync p99  (the acceptance criterion)
+# ===========================================================================
+mv "${RESULT_FILE}.tmp" "${RESULT_FILE}"
+
+if should_run 10; then
+hdr "10. Phase 4 acceptance — redirect p99, async vs sync"
+
+SYNC_FILE="${RESULTS_DIR}/phase4_sync.env"
+ASYNC_FILE="${RESULTS_DIR}/phase4_async.env"
+detail "this run recorded to ${RESULT_FILE}"
+
+if [[ ! -f "${SYNC_FILE}" || ! -f "${ASYNC_FILE}" ]]; then
+  skipped "need BOTH runs to compare."
+  [[ -f "${SYNC_FILE}" ]]  || detail "missing: sync run  (CLICK_MODE=sync  server + script)"
+  [[ -f "${ASYNC_FILE}" ]] || detail "missing: async run (CLICK_MODE=async server + script)"
+else
+  get() { grep "^$2=" "$1" | tail -n1 | cut -d= -f2-; }
+  S_P99="$(get "${SYNC_FILE}" HOT_P99)";  A_P99="$(get "${ASYNC_FILE}" HOT_P99)"
+  S_P50="$(get "${SYNC_FILE}" HOT_P50)";  A_P50="$(get "${ASYNC_FILE}" HOT_P50)"
+  S_RPS="$(get "${SYNC_FILE}" HOT_RPS)";  A_RPS="$(get "${ASYNC_FILE}" HOT_RPS)"
+  S_DU="$(get "${SYNC_FILE}" HOT_DIALUP)"; A_DU="$(get "${ASYNC_FILE}" HOT_DIALUP)"
+  S_TS="$(get "${SYNC_FILE}" TIMESTAMP)"; A_TS="$(get "${ASYNC_FILE}" TIMESTAMP)"
+  S_C="$(get "${SYNC_FILE}" CONCURRENCY)"; A_C="$(get "${ASYNC_FILE}" CONCURRENCY)"
+
+  printf '        %-12s %10s %10s %10s %10s\n' "" "req/s" "p50 ms" "p99 ms" "dialup"
+  printf '        %-12s %10s %10s %10s %10s\n' "sync"  "${S_RPS}" "${S_P50}" "${S_P99}" "${S_DU}"
+  printf '        %-12s %10s %10s %10s %10s\n' "async" "${A_RPS}" "${A_P50}" "${A_P99}" "${A_DU}"
+  detail "sync run : ${S_TS}"
+  detail "async run: ${A_TS}"
+
+  VALID=1
+  if [[ "${S_C}" != "${A_C}" ]]; then
+    fail "runs used different concurrency (${S_C} vs ${A_C}) — not comparable."
+    VALID=0
+  fi
+  if awk "BEGIN{exit !(${S_DU} > 7 || ${A_DU} > 7)}"; then
+    warn "one or both runs had DNS+dialup > 7 ms — host contention likely."
+    detail "Rerun the noisier mode before trusting the verdict."
+  fi
+  if [[ -z "${S_P99}" || -z "${A_P99}" || "${S_P99}" == "0" ]]; then
+    fail "p99 missing from a results file — rerun both modes."
+    VALID=0
+  fi
+
+  if [[ "${VALID}" -eq 1 ]]; then
+    IMPROVE="$(awk "BEGIN{printf \"%.1f\", 100*(${S_P99}-${A_P99})/${S_P99}}")"
+    RPS_GAIN="$(awk "BEGIN{printf \"%.1f\", 100*(${A_RPS}-${S_RPS})/${S_RPS}}")"
+    detail ""
+    detail "p99 improvement   : ${IMPROVE}%"
+    detail "throughput change : ${RPS_GAIN}%"
+
+    if awk "BEGIN{exit !(${IMPROVE} >= ${MATERIAL_IMPROVEMENT_PCT})}"; then
+      pass "async p99 is ${IMPROVE}% lower than sync — materially better (≥${MATERIAL_IMPROVEMENT_PCT}%)."
+      green "  M4: It's fast — acceptance criterion met."
+    elif awk "BEGIN{exit !(${IMPROVE} > 0)}"; then
+      fail "async p99 only ${IMPROVE}% better — not material (threshold ${MATERIAL_IMPROVEMENT_PCT}%)."
+      detail "Possibilities: sync INSERT is faster than expected on a fresh DB,"
+      detail "or the server was not actually in sync mode for the sync run."
+    else
+      fail "async p99 is WORSE than sync (${IMPROVE}%)."
+      detail "Suspect a mislabelled run, a debug build, or host contention."
+    fi
+  fi
+fi
+fi
+
+# ===========================================================================
+# 11. CACHE STATISTICS SUMMARY
+# ===========================================================================
+if should_run 11 && [[ "${STATS_AVAILABLE}" -eq 1 ]]; then
+hdr "11. Cache statistics (cumulative)"
+H="$(stat_field hits)"; NG="$(stat_field negative_hits)"
+M="$(stat_field misses)"; D="$(stat_field db_queries)"
+T=$(( H + NG + M ))
+if [[ "${T}" -gt 0 ]]; then
+  R="$(awk "BEGIN{printf \"%.4f\", (${H}+${NG})/${T}}")"
+  detail "hits ${H} · negative ${NG} · misses ${M} · db ${D}"
+  detail "hit ratio ${R}  ->  expected ~$(awk "BEGIN{printf \"%.0f\", ${R}*${BENCH_HIT_NS}+(1-${R})*${BENCH_MISS_NS}}") ns/lookup"
+  warn "cumulative counters, not a rate — Prometheus rate() is the Phase 5 form."
+fi
 fi
 
 # ===========================================================================
 # VERDICT
 # ===========================================================================
-hdr "Verdict"
-
-if [[ "${BENCH_MODE}" -eq 0 ]]; then
-  warn "Ran in LIMITED mode: measurement probes were skipped because the"
-  detail "rate limiter engages at this request volume. For a full run, start"
-  detail "the server in BENCH MODE (see script header)."
-fi
-
+hdr "Verdict  (CLICK_MODE=${CLICK_MODE})"
+detail "results: ${RESULT_FILE}"
 if [[ "${FAILURES}" -eq 0 ]]; then
   green "  All probes passed.  (${WARNINGS} warning(s))"
-  echo
-  exit 0
+  echo; exit 0
 else
   red "  ${FAILURES} probe(s) FAILED.  (${WARNINGS} warning(s))"
-  echo
-  exit 1
+  echo; exit 1
 fi
+
+# ===========================================================================
+# APPENDIX — server-side support this script expects
+# ===========================================================================
+#
+# 1. Counters on ClickSender / the writer (workers/analytics_writer.rs):
+#
+#    #[derive(Default)]
+#    pub struct WriterStats {
+#        pub enqueued: AtomicU64,
+#        pub dropped: AtomicU64,
+#        pub batches: AtomicU64,
+#        pub rows_written: AtomicU64,
+#        pub failed_batches: AtomicU64,
+#    }
+#
+#    - record():  Ok  => enqueued += 1 ;  Err => dropped += 1
+#    - writer:    Ok  => batches += 1, rows_written += batch.len()
+#                 Err => failed_batches += 1
+#    - queue depth: tx.max_capacity() - tx.capacity()
+#
+# 2. GET /debug/analytics (dev only, next to /debug/cache):
+#
+#    Json(json!({
+#        "mode": "async",                 // or "sync"
+#        "enqueued": s.enqueued, "dropped": s.dropped,
+#        "batches": s.batches, "rows_written": s.rows_written,
+#        "failed_batches": s.failed_batches,
+#        "queue_depth": sender.queue_depth(),
+#        "max_batch": cfg.max_batch,
+#    }))
+#
+# 3. CLICK_MODE=sync|async read in config::load(). In sync mode,
+#    RedirectService awaits click_repo.insert_batch(&[click]) instead of
+#    calling clicks.record(). Remove the sync path once Phase 4 is proven —
+#    it exists only to produce the baseline the acceptance criterion needs.

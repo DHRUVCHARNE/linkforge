@@ -1,6 +1,20 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub enum ClickMode {
+    Sync,
+    Async,
+}
+
+impl ClickMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClickMode::Async => "async",
+            ClickMode::Sync => "sync",
+        }
+    }
+}
 /// Top-level application configuration
 /// Built once at startup by `config::load()`, then treated as read-only
 
@@ -13,6 +27,7 @@ pub struct Settings {
     pub auth: AuthConfig,
     pub env: Environment,
     pub cache: CacheConfig,
+    pub analytics: AnalyticsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,8 +80,17 @@ pub struct RateLimitConfig {
     pub requests: u32,
     #[serde(default = "default_rate_window_secs")]
     pub window_secs: u64,
+    #[serde(default = "default_rate_sweep_secs")]
+    pub sweep_interval: u64,
+    #[serde(default = "default_rate_idle_ttl_secs")]
+    pub idle_ttl: u64,
 }
-
+pub fn default_rate_sweep_secs() -> u64 {
+    300
+}
+pub fn default_rate_idle_ttl_secs() -> u64 {
+    3600
+}
 impl RateLimitConfig {
     pub fn window(&self) -> Duration {
         Duration::from_secs(self.window_secs)
@@ -128,4 +152,42 @@ impl std::fmt::Debug for AuthConfig {
             .field("jwt_expiry_secs", &self.jwt_expiry_secs)
             .finish()
     }
+}
+// src/config/settings.rs
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticsConfig {
+    /// Bounded channel depth. This is the MEMORY CEILING: capacity ×
+    /// sizeof(Click). Larger absorbs bigger bursts; smaller drops sooner
+    /// but bounds RAM tighter.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+
+    /// Max rows per INSERT. Postgres caps bind params at 65,535; at 3
+    /// columns that is ~21,800 rows. Stay well under.
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
+
+    /// How long the writer waits to fill a partial batch. Trades staleness
+    /// for fewer DB round trips.
+    #[serde(default = "default_batch_wait_ms")]
+    pub batch_wait_ms: u64,
+
+    pub ip_salt: String,
+    pub click_mode: ClickMode,
+}
+
+impl AnalyticsConfig {
+    pub fn batch_wait(&self) -> Duration {
+        Duration::from_millis(self.batch_wait_ms)
+    }
+}
+
+fn default_channel_capacity() -> usize {
+    10_000
+}
+fn default_max_batch() -> usize {
+    500
+}
+fn default_batch_wait_ms() -> u64 {
+    50
 }
