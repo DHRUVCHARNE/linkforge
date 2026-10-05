@@ -11,9 +11,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    }, time::Duration,
+    },
+    time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 #[derive(Default)]
 pub struct WriterStats {
@@ -34,32 +35,43 @@ impl ClickSender {
     /// Non-blocking. Never awaits - this is called from the redirect path
     pub fn record(&self, click: Click) {
         match self.tx.try_send(click) {
-            Ok(()) => {self.stats.enqueued.fetch_add(1, Ordering::Relaxed);},
+            Ok(()) => {
+                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("linkforge_clicks_enqueued_total").increment(1);
+            }
             Err(_) => {
                 let n = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                metrics::counter!("linkforge_clicks_dropped_total").increment(1);
+
                 if n % 1000 == 1 {
                     tracing::warn!(dropped_total = n, "click_channel full, dropping");
                 }
             }
         }
+        metrics::gauge!("linkforge_click_queue_depth").set(self.queue_depth() as f64);
     }
     pub fn queue_depth(&self) -> usize {
-        self.tx.max_capacity()-self.tx.capacity()
+        self.tx.max_capacity() - self.tx.capacity()
     }
-    pub fn stats(&self) -> &WriterStats {&self.stats}
+    pub fn stats(&self) -> &WriterStats {
+        &self.stats
+    }
     pub fn max_batch(&self) -> usize {
         self.max_batch
     }
 }
 
-pub fn spawn(repo: Arc<dyn ClickRepository>, cfg: &AnalyticsConfig) -> ClickSender {
+pub fn spawn(
+    repo: Arc<dyn ClickRepository>,
+    cfg: &AnalyticsConfig,
+) -> (ClickSender, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<Click>(cfg.channel_capacity);
     let stats = Arc::new(WriterStats::default());
     let max_batch = cfg.max_batch;
     let max_wait = Duration::from_millis(cfg.batch_wait_ms);
     let task_stats = stats.clone();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut batch: Vec<Click> = Vec::with_capacity(max_batch);
         while let Some(first) = rx.recv().await {
             //clears previous clicks in the batch
@@ -92,18 +104,27 @@ pub fn spawn(repo: Arc<dyn ClickRepository>, cfg: &AnalyticsConfig) -> ClickSend
                 }
             }
             match repo.insert_batch(&batch).await {
-                Ok(())=> {
+                Ok(()) => {
                     task_stats.batches.fetch_add(1, Ordering::Relaxed);
-                    task_stats.rows_written.fetch_add(batch.len() as u64,Ordering::Relaxed );
-                },
-                Err(e)=> {
+                    metrics::counter!("linkforge_click_batches_total").increment(1);
+
+                    task_stats.rows_written.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    metrics::counter!("linkforge_click_rrows_written_total")
+                        .increment(batch.len() as u64);
+                }
+                Err(e) => {
                     task_stats.failed_batches.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("linkforge_click_batch_failures_total").increment(1);
+
                     tracing::error!(error=?e,n=batch.len(),"click batch insert failed");
                 }
             }
-            
         }
-        tracing::info!("click writer is shutting down");
+        tracing::info!(
+            rows_writtem = task_stats.rows_written.load(Ordering::Relaxed),
+            dropped = task_stats.dropped.load(Ordering::Relaxed),
+            "click writer drained and stopped"
+        );
     });
-    ClickSender { tx, stats,max_batch}
+    (ClickSender { tx, stats, max_batch }, handle)
 }

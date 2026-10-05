@@ -85,6 +85,11 @@ impl Cache for InMemoryCache {
         let entry = match self.map.get(code).map(|e| e.value().clone()) {
             Some(e) => e,
             None => {
+                metrics::counter!(
+                    "linkforge_cache_misses_total",
+                    "result"=>"miss"
+                )
+                .increment(1);
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -93,15 +98,30 @@ impl Cache for InMemoryCache {
             && Instant::now() >= exp
         {
             self.map.remove(code);
+            metrics::counter!(
+                "linkforge_cache_misses_total",
+                "result"=>"miss"
+            )
+            .increment(1);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None; //lazy eviction
         }
         Some(match &entry.value {
             Some(url) => {
+                metrics::counter!(
+                    "linkforge_cache_lookups_total",
+                    "result"=>"hit"
+                )
+                .increment(1);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 Cached::Hit(url.clone())
             }
             None => {
+                metrics::counter!(
+                    "linkforge_cache_lookups_total",
+                    "result"=>"negative_hit"
+                )
+                .increment(1);
                 self.negative_hits.fetch_add(1, Ordering::Relaxed);
                 Cached::Missing
             }

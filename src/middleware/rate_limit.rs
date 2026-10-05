@@ -62,6 +62,9 @@ impl RateLimitState {
         self.buckets.retain(|_, b| b.last_refill.elapsed() < idle);
         before - self.buckets.len()
     }
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
 }
 
 #[derive(Clone)]
@@ -116,6 +119,7 @@ where
             bucket.try_consume(self.state.capacity, self.state.refill_per_sec)
         };
         if !allowed {
+            metrics::counter!("linkforge_rate_limit_rejections_total").increment(1);
             tracing::warn!(%ip, "rate limit exceeded");
             let retry_after = self.state.refill_per_sec.recip().ceil() as u64;
             let resp = Response::builder()

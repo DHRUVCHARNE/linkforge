@@ -1,16 +1,16 @@
+use linkforge::{app, config};
 use std::net::SocketAddr;
-use linkforge::config;
-use tokio::net::TcpListener;
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let settings = config::load()?;
     let _guard = linkforge::observability::tracing::init(&settings);
-    let state = linkforge::app::state::AppState::build(&settings).await?;
-    let app = linkforge::app::router::create(state);
-    let addr = format!("{}:{}", settings.server.host, settings.server.port);
-    let listener = TcpListener::bind(&addr).await?;
-    println!("Server is live at http://{addr}");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    let metrics = linkforge::observability::metrics::init()?;
+    let (state, workers) = app::state::AppState::build(&settings, metrics).await?;
+    let readiness=state.health.readiness_handle();
+    let router = app::router::create(state);
+    let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
+    app::serve(router, addr,readiness,settings.server.shutdown_delay()).await?;
+    workers.shutdown().await;
+    tracing::info!("shutdown complete");
     Ok(())
 }

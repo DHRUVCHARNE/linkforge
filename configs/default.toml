@@ -1,0 +1,29 @@
+env = "development"
+
+[server]
+host = "0.0.0.0"
+port = 3000
+request_timeout_secs = 10
+debug_routes = false
+shutdown_delay_secs=3
+
+[database]
+max_connections = 20
+statement_timeout_secs = 2
+acquire_timeout_secs = 3
+idle_timeout_secs = 300
+
+[cache]
+negative_ttl_secs = 30
+
+[rate_limit]
+requests = 100
+window_secs = 60
+sweep_interval_secs = 300
+idle_ttl_secs = 3600
+
+[analytics]
+channel_capacity = 10000
+max_batch = 500
+batch_wait_ms = 50
+click_mode = "async"

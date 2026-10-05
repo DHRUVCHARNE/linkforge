@@ -34,6 +34,7 @@ use std::time::Duration;
 use linkforge::middleware::rate_limit::RateLimitState;
 use linkforge::repositories::click_repository::SqlxClickRepository;
 use linkforge::services::analytics::AnalyticsService;
+use linkforge::services::health::{HealthService, Readiness};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection};
 use uuid::Uuid;
@@ -47,13 +48,28 @@ use linkforge::repositories::link_repository::SqlxLinkRepository;
 use linkforge::repositories::{ClickRepository, LinkRepository};
 use linkforge::services::{redirect::RedirectService, shortener::ShortenerService};
 
+// tests/common/mod.rs
+use std::sync::OnceLock;
+
+use metrics_exporter_prometheus::PrometheusHandle;
+
+/// The metrics recorder is process-global and can be installed only once.
+/// Every test server in this binary shares the same handle.
+fn test_metrics() -> PrometheusHandle {
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            linkforge::observability::metrics::init().expect("install metrics recorder")
+        })
+        .clone()
+}
 /// Negative-cache TTL used by the harness. Short enough that a test can wait
 /// it out if it needs to, long enough not to expire mid-assertion.
 const TEST_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 
 /// Effectively unlimited. Tests exercise handlers, not the limiter.
 fn permissive_rate_limit() -> RateLimitConfig {
-    RateLimitConfig { requests: 1_000_000, window_secs: 1, sweep_interval: 300, idle_ttl: 3600 }
+    RateLimitConfig { requests: 1_000_000, window_secs: 1, sweep_interval_secs: 300, idle_ttl_secs: 3600 }
 }
 
 /// Connection string for the Postgres *server*. Falls back to the local
@@ -86,6 +102,7 @@ pub struct TestApp {
     pub cache: Arc<dyn Cache>,
     /// Name of the throwaway database, kept for teardown.
     db_name: String,
+    pub readiness:Readiness
 }
 
 #[allow(dead_code)]
@@ -103,8 +120,8 @@ impl TestApp {
         Self::spawn_with_config(RateLimitConfig {
             requests,
             window_secs,
-            sweep_interval: 300,
-            idle_ttl: 3600,
+            sweep_interval_secs: 300,
+            idle_ttl_secs: 3600,
         })
         .await
     }
@@ -140,9 +157,9 @@ impl TestApp {
 
         // --- 3. Boot the server; take ITS cache so invalidation targets the
         //        same Arc the services are using.
-        let (address, client, cache) = spawn_server(pool.clone(), rate_limit).await;
+        let (address, client, cache,readiness) = spawn_server(pool.clone(), rate_limit).await;
 
-        Self { address, client, pool, cache, db_name }
+        Self { address, client, pool, cache, db_name,readiness:readiness}
     }
 
     /// Boot a SECOND server against the same database with a **cold cache**.
@@ -151,7 +168,7 @@ impl TestApp {
     /// that still resolves must have come from Postgres. Always permissive —
     /// a restart test should never inherit a tight bucket.
     pub async fn restart(&self) -> RestartedApp {
-        let (address, client, _) = spawn_server(self.pool.clone(), permissive_rate_limit()).await;
+        let (address, client,_,_) = spawn_server(self.pool.clone(), permissive_rate_limit()).await;
         RestartedApp { address, client }
     }
 
@@ -252,7 +269,7 @@ pub fn test_analytics_config() -> AnalyticsConfig {
         max_batch: 500,
         batch_wait_ms: 5,
         ip_salt: "test-salt".into(),
-        click_mode:linkforge::config::ClickMode::Async
+        click_mode: linkforge::config::ClickMode::Async,
     }
 }
 
@@ -264,7 +281,8 @@ pub fn test_analytics_config() -> AnalyticsConfig {
 async fn spawn_server(
     pool: PgPool,
     rate_limit: RateLimitConfig,
-) -> (String, reqwest::Client, Arc<dyn Cache>) {
+) -> (String, reqwest::Client, Arc<dyn Cache>,Readiness) {
+    let _ = dotenvy::dotenv();
     // Resume the counter past the highest existing id, exactly as production
     // does — otherwise a restarted instance reissues codes that already exist.
     let start_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM links")
@@ -278,7 +296,7 @@ async fn spawn_server(
     let shortener =
         Arc::new(ShortenerService::new(links.clone(), cache.clone(), start_id as u64 + 1));
     let click_repo: Arc<dyn ClickRepository> = Arc::new(SqlxClickRepository::new(pool));
-    let clicks =
+    let (clicks, _) =
         linkforge::workers::analytics_writer::spawn(click_repo.clone(), &analytics_settings);
     let redirect = Arc::new(RedirectService::new(
         links.clone(),
@@ -286,7 +304,7 @@ async fn spawn_server(
         clicks.clone(),
         Arc::from(analytics_settings.ip_salt),
         linkforge::config::ClickMode::Async,
-        click_repo.clone()
+        click_repo.clone(),
     ));
     let analytics = Arc::new(AnalyticsService::new(click_repo.clone(), links.clone()));
 
@@ -295,18 +313,23 @@ async fn spawn_server(
         .expect("failed to bind ephemeral test port");
     let addr: SocketAddr = listener.local_addr().expect("listener has no local addr");
     let rate_limiter = RateLimitState::from_config(&rate_limit);
+    let metrics= test_metrics();
+    let readiness = Readiness::default();
     let state = AppState {
         shortener,
         redirect,
         base_url: Arc::from(format!("http://{addr}").as_str()),
         cache: cache.clone(),
-        links,
+        links:links.clone(),
         debug_routes: true,
         rate_limit,
         analytics,
         rate_limiter,
         clicks,
-        click_mode:linkforge::config::ClickMode::Async
+        click_mode: linkforge::config::ClickMode::Async,
+        request_timeout: Duration::from_secs(10),
+        metrics,
+        health:Arc::new(HealthService::new(links,readiness.clone(), Duration::from_secs(5)))
     };
 
     let app = router::create(state);
@@ -325,5 +348,5 @@ async fn spawn_server(
         .build()
         .expect("failed to build reqwest client");
 
-    (format!("http://{addr}"), client, cache)
+    (format!("http://{addr}"), client, cache,readiness)
 }

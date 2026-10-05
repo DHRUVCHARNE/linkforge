@@ -20,6 +20,7 @@ pub trait LinkRepository: Send + Sync {
     fn query_count(&self) -> u64 {
         0
     }
+    async fn ping(&self) -> Result<(), RepoError>;
 }
 
 #[async_trait]

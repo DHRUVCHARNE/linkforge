@@ -1,0 +1,6 @@
+[server]
+debug_routes = true
+shutdown_delay_secs=3
+
+[cache]
+negative_ttl_secs = 5   # short, so manual testing isn't confusing

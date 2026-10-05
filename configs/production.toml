@@ -1,0 +1,5 @@
+[server]
+debug_routes = false
+
+[database]
+max_connections = 20

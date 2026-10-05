@@ -45,4 +45,9 @@ impl LinkRepository for SqlxLinkRepository {
     fn query_count(&self) -> u64 {
         self.queries.load(Ordering::Relaxed)
     }
+
+    async fn ping(&self) -> Result<(),RepoError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
 }
