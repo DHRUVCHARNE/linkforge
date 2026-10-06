@@ -6,6 +6,9 @@ use axum::{
     response::Response,
 };
 
+use crate::observability::metrics::{HTTP_DURATION, HTTP_REQUESTS};
+
+
 pub async fn track(req: Request, next: Next) -> Response {
     let start = Instant::now();
     let method = req.method().clone();
@@ -19,14 +22,14 @@ pub async fn track(req: Request, next: Next) -> Response {
     let elapsed = start.elapsed().as_secs_f64();
 
     metrics::counter!(
-        "linkforge_http_requests_total",
+        HTTP_REQUESTS,
         "method"=>method.to_string(),
         "route"=>route.clone(),
         "status"=>status
     )
     .increment(1);
-    metrics::histogram!("linkforge_http_requests_duration_seconds"
-    , "methos"=>method.to_string(),
+    metrics::histogram!(HTTP_DURATION
+    , "method"=>method.to_string(),
     "route"=>route
     )
     .record(elapsed);

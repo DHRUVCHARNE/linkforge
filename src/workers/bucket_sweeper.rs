@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-use crate::middleware::rate_limit::RateLimitState;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+use crate::{middleware::rate_limit::RateLimitState, observability::metrics::RATE_LIMIT_BUCKETS};
 
 pub fn spawn(
     state: RateLimitState,
@@ -18,7 +19,7 @@ pub fn spawn(
             "bucket sweeper started"
         );
         ticker.tick().await;
-        metrics::gauge!("linkforge_rate_limit_buckets").set(state.bucket_count() as f64);
+        metrics::gauge!(RATE_LIMIT_BUCKETS).set(state.bucket_count() as f64);
         loop {
             tokio::select! {
                 _=cancel.cancelled() => {
@@ -28,7 +29,7 @@ pub fn spawn(
                 _=ticker.tick() => {
 
                     let evicted = state.sweep(idle);
-                                        metrics::gauge!("linkforge_rate_limit_buckets").set(state.bucket_count() as f64);
+                                        metrics::gauge!(RATE_LIMIT_BUCKETS).set(state.bucket_count() as f64);
 
                     if evicted > 0 {
                         tracing::info!(evicted,buckets_remaining=state.bucket_count(), "swept idle rate-limiting buckets");

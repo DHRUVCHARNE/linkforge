@@ -6,7 +6,7 @@
 // * Analytics are best-effort. An undercounted click is acceptable; a delayed redirect is not
 // * A Bounded + drop gives a HARD memory ceiling. Unbounded would trade a latency problem for an OOM (Out Of Memory)
 // The cost: under sustained overload, click counts undercount. Dropped events are counted and logged so the loss is VISIBLE rather than silent.
-use crate::{config::AnalyticsConfig, domain::click::Click, repositories::ClickRepository};
+use crate::{config::AnalyticsConfig, domain::click::Click, observability::metrics::{CLICK_BATCH_FAILURES, CLICK_BATCHES, CLICK_QUEUE_DEPTH, CLICK_ROWS_WRITTEN, CLICKS_DROPPED, CLICKS_ENQUEUED}, repositories::ClickRepository};
 use std::{
     sync::{
         Arc,
@@ -37,18 +37,18 @@ impl ClickSender {
         match self.tx.try_send(click) {
             Ok(()) => {
                 self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("linkforge_clicks_enqueued_total").increment(1);
+                metrics::counter!(CLICKS_ENQUEUED).increment(1);
             }
             Err(_) => {
                 let n = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                metrics::counter!("linkforge_clicks_dropped_total").increment(1);
+                metrics::counter!(CLICKS_DROPPED).increment(1);
 
                 if n % 1000 == 1 {
                     tracing::warn!(dropped_total = n, "click_channel full, dropping");
                 }
             }
         }
-        metrics::gauge!("linkforge_click_queue_depth").set(self.queue_depth() as f64);
+        metrics::gauge!(CLICK_QUEUE_DEPTH).set(self.queue_depth() as f64);
     }
     pub fn queue_depth(&self) -> usize {
         self.tx.max_capacity() - self.tx.capacity()
@@ -106,22 +106,22 @@ pub fn spawn(
             match repo.insert_batch(&batch).await {
                 Ok(()) => {
                     task_stats.batches.fetch_add(1, Ordering::Relaxed);
-                    metrics::counter!("linkforge_click_batches_total").increment(1);
+                    metrics::counter!(CLICK_BATCHES).increment(1);
 
                     task_stats.rows_written.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                    metrics::counter!("linkforge_click_rrows_written_total")
+                    metrics::counter!(CLICK_ROWS_WRITTEN)
                         .increment(batch.len() as u64);
                 }
                 Err(e) => {
                     task_stats.failed_batches.fetch_add(1, Ordering::Relaxed);
-                    metrics::counter!("linkforge_click_batch_failures_total").increment(1);
+                    metrics::counter!(CLICK_BATCH_FAILURES).increment(1);
 
                     tracing::error!(error=?e,n=batch.len(),"click batch insert failed");
                 }
             }
         }
         tracing::info!(
-            rows_writtem = task_stats.rows_written.load(Ordering::Relaxed),
+            rows_written = task_stats.rows_written.load(Ordering::Relaxed),
             dropped = task_stats.dropped.load(Ordering::Relaxed),
             "click writer drained and stopped"
         );

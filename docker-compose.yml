@@ -34,24 +34,25 @@ services:
       timeout: 3s
       retries: 5
   app:
-    build:
+    build: .
     container_name: linkforge-app
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
-    ports:
-      - "3000:3000"
     environment:
-       APP_ENV: ${APP_ENV:-production}
+       APP_ENV: ${CONTAINER_APP_ENV:-production}
        # Service name, not localhost: inside the container, localhost is the app itself.
-       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB}
        ANALYTICS_IP_SALT: ${ANALYTICS_IP_SALT}
        RUST_LOG: ${RUST_LOG:-linkforge=info,tower_http=warn,sqlx=warn}
        # All host traffic reaches the container from one bridge IP, so it shares
        # one rate-limit bucket. Tests raise this; the default stays realistic.
        LINKFORGE__RATE_LIMIT__REQUESTS: ${LINKFORGE__RATE_LIMIT__REQUESTS:-100}
-       stop_signal: SIGTERM
-       stop_grace_period: 30s
+       LINKFORGE__RATE_LIMIT__WINDOW_SECS: ${LINKFORGE__RATE_LIMIT__WINDOW_SECS:-60}
+       LINKFORGE__ANALYTICS__CLICK_MODE: ${LINKFORGE__ANALYTICS__CLICK_MODE:-async}
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
 
 volumes:
   pgdata:

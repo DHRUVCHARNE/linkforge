@@ -1,422 +1,345 @@
-## Baseline — Phase 1 (in-memory)
-
-Env: GitHub Codespaces, 2 vCPU · load generator co-located (see caveat)
-Hot read path `GET /:code`, oha 10s, keepalive on
-
-| c   | req/s  | p50     | p99      |
-| --- | ------ | ------- | -------- |
-| 50  | 10,394 | 4.57 ms | 11.66 ms |
-| 100 | 9,763  | 9.82 ms | 23.04 ms |
-
-Correctness: 10,000 concurrent POSTs → 0 duplicate codes.
-
-⚠️ Caveat: throughput is environment-bound at ~10k req/s. DashMap vs
-RwLock<HashMap> and worker_threads 2 vs 10 produced no measurable
-difference — the ceiling is CPU contention with the co-located load
-generator, not application code. Treat p99 @ c=50 as the comparison
-point for Phase 4, and only compare runs taken on identical hardware.
-### Application-level benchmark (criterion, HTTP excluded)
-
-`ShortenerService::lookup` (cache hit): **39.75 ns** [37.9, 41.7]
-
-→ Application logic is 0.0004% of the 9.82 ms observed p50.
-→ Theoretical single-core ceiling: ~25M lookups/sec vs ~10K req/s measured.
-→ Conclusion: Phase 1 is entirely transport- and environment-bound.
-   No further in-memory optimization is justified.
-## Baseline — Phase 2 (Postgres + read-through cache)
-
-Env: GitHub Codespaces, 2 vCPU · Postgres + Redis containers co-located
-Hot read path `GET /:code`, oha 10s, keepalive on
-
-| c   | req/s  | p50      | p99      |
-| --- | ------ | -------- | -------- |
-| 50  | 10,144 | 4.56 ms  | 13.34 ms |
-| 100 | 5,539  | 16.49 ms | 47.59 ms |
-
-Correctness: 10,000 concurrent POSTs → 0 duplicate codes, all persisted.
-
-### Application-level (criterion, HTTP excluded)
-
-| Path                     | Time      |
-| ------------------------ | --------- |
-| `InMemoryCache::get` hit | 219.38 ns |
-| `find_by_code` (DB)      | 450.01 µs |
-
-→ **Cache miss costs ~2,051× a hit.** This is the measured justification
-  for the read-through cache.
-→ p50 unchanged vs Phase 1 (4.57 → 4.56 ms): adding persistence cost the
-  hot path nothing, because hits never reach Postgres.
-
-⚠️ Caveats: cache_hit is not comparable to Phase 1's 39.75 ns — the bench
-  now goes through an async trait + rt.block_on. The c=100 regression
-  (9,763 → 5,539) is CPU contention from co-located containers, not
-  application code; DNS+dialup rose 1.70 → 8.62 ms. 15% outliers.
- ## Phase 2 — Final (Postgres + read-through cache + negative caching + single-flight)
-
-Env: GitHub Codespaces, 2 vCPU · Postgres co-located · fresh database
-
-| Probe                   | Result                                                   |
-| ----------------------- | -------------------------------------------------------- |
-| 10,000 concurrent POSTs | 10,000 unique codes, 0 duplicates, 0 failures            |
-| Hot read path @ c=100   | 9,783 req/s · p50 9.55ms · p99 25.13ms                   |
-| Negative caching        | 501 requests, 1 nonexistent code → **1 DB query**        |
-| Single-flight           | 100 concurrent misses → **1 DB query** (100× coalescing) |
-| Hit ratio               | 99.89% → expected ~714 ns/lookup                         |
-
-Parity with Phase 1 in-memory (9,763 req/s @ c=100): persistence, caching,
-and coalescing cost the hot path nothing measurable.
-
-⚠️ Write throughput degrades as `links` grows — a table with ~40k rows
-produced 8% write failures at c=100 (unique-index insert cost exceeding
-the 3s pool acquire_timeout). The load test must run against a fresh
-database to be comparable.
-## Baseline — Phase 3 (tracing + request IDs + per-IP rate limiting)
-
-Env: GitHub Codespaces, 2 vCPU · Postgres + Redis co-located · fresh database
-Hot read path `GET /:code`, oha 10s, keepalive on
-Server started in BENCH MODE (`RATE_LIMIT_REQUESTS=100000000`) so the
-limiter cannot throttle the benchmark.
-
-| c   | req/s | p50      | p99      |
-| --- | ----- | -------- | -------- |
-| 100 | 5,404 | 17.15 ms | 47.32 ms |
-
-Correctness: 10,000 concurrent POSTs → 10,000 unique codes, 0 duplicates,
-0 failures (429: 0, 500: 0).
-
-### Phase 3 acceptance
-
-| Criterion                                  | Result                            |
-| ------------------------------------------ | --------------------------------- |
-| Client `x-request-id` echoed unchanged     | ✅                                 |
-| `x-request-id` generated when absent       | ✅ (UUID v4)                       |
-| Generated IDs distinct across requests     | ✅                                 |
-| Exceeding the rate returns 429             | ⚠️ verified separately — see below |
-| Logs correlate across middleware + handler | ⚠️ manual grep — see below         |
-
-### Carried forward from Phase 2 (still passing)
-
-| Probe              | Result                                                   |
-| ------------------ | -------------------------------------------------------- |
-| Negative caching   | 501 requests, 1 nonexistent code → **1 DB query**        |
-| Single-flight      | 129 concurrent misses → **1 DB query** (129× coalescing) |
-| Hit ratio          | 99.76% → expected ~1,298 ns/lookup                       |
-| Overall coalescing | 22.33 cache misses per DB query                          |
-
-### ⚠️ Throughput regression: 9,783 → 5,404 req/s (−45%)
-
-p50 rose 9.55 → 17.15 ms; p99 rose 25.13 → 47.32 ms. This is a real delta,
-far outside the ~2% run-to-run noise floor.
-
-**Cause not yet isolated.** Three candidates, untested:
-
-1. Per-request tracing spans (CPU cost of `TraceLayer` + subscriber)
-2. The rate limiter — all load originates from one IP, so every request
-   contends on a single `DashMap` shard: the pathological case for sharding
-3. Environment noise — `DNS+dialup` rose 4.5 → 13.87 ms, which is scheduler
-   contention, not application code
-
-To isolate, rerun with `RUST_LOG=off`, then with the `RateLimitLayer`
-removed, comparing each against this figure.
-
-⚠️ A previous phase attributed a similar one-off regression (9,763 → 5,539)
-to container CPU contention; it did not reproduce across two subsequent
-runs. **Do not accept this number from a single run.**
-
-### ⚠️ Benchmark methodology change
-
-From Phase 3 the server must be started in BENCH MODE or the rate limiter
-throttles the harness itself. An earlier run recorded 192/10,000 successful
-writes — 9,808 of them 429s — which under the Phase 2 script would have
-appeared as silent write failures and been misdiagnosed as pool timeouts.
-
-    RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 just run
-    ### Phase 3 regression — ISOLATED
-
-| Config                   | tracing | limiter | req/s     | p50      | DNS+dialup   |
-| ------------------------ | ------- | ------- | --------- | -------- | ------------ |
-| Phase 2 final            | —       | —       | 9,783     | 9.55 ms  | ~4.5 ms      |
-| Phase 3 full (mean of 2) | on      | on      | 5,583     | 16.85 ms | 4.9–13.9 ms  |
-| `RUST_LOG=off`           | off     | on      | **6,973** | 13.49 ms | 6.71 ms      |
-| limiter removed          | on      | off     | 4,717     | 18.98 ms | **10.81 ms** |
-
-**Finding: tracing costs ~20% throughput** (6,973 → 5,583) and ~3.4 ms p50.
-This is the measured price of observability, accepted deliberately.
-
-**Finding: the rate limiter costs nothing measurable.** Removing it produced
-a *lower* number, which is impossible as a causal effect — that run had the
-worst DNS+dialup of the three (10.81 ms) and is treated as contaminated.
-Contrary to the earlier hypothesis, single-IP DashMap shard contention is
-not a bottleneck at this load.
-
-⚠️ ~2,800 req/s of the Phase 2 → Phase 3 gap remains unexplained even with
-tracing off. Untested candidates: per-request UUID generation in
-SetRequestIdLayer, span *construction* cost in TraceLayer (RUST_LOG=off
-silences output but spans are still built), or environment drift.
-### Phase 3 regression — FULLY ISOLATED
-
-| Config               | middleware | logging | req/s     | p50      |
-| -------------------- | ---------- | ------- | --------- | -------- |
-| Phase 2 reference    | —          | —       | 9,783     | 9.55 ms  |
-| Stack removed        | none       | off     | **9,090** | 10.33 ms |
-| Stack on, output off | on         | off     | 6,973     | 13.49 ms |
-| Full Phase 3         | on         | on      | 5,583     | 16.85 ms |
-
-**Attribution:**
-- Middleware *construction* (spans + UUID generation): **−23%**
-- Log *emission* (formatting + stdout): **−20% further**
-- Rate limiter: **no measurable cost**
-- Application code: **unchanged** (criterion p > 0.05 across all phases)
-
-Phase 2's baseline reproduces (9,090 vs 9,783, ~7% session drift), so the
-entire Phase 2 → Phase 3 delta is the observability stack. Total cost of
-observability: **~39% throughput, ~6.5 ms p50.**
-
-⚠️ Surprising result: span CONSTRUCTION costs more than log EMISSION.
-`RUST_LOG=off` silences output but `info_span!` still allocates its fields.
-Mitigations: `release_max_level_info` feature, or fewer/cheaper span fields.
-### ⚠️ BUILD PROFILE CORRECTION
-
-Every benchmark prior to this point was taken against a **debug build**.
-`just run` used `cargo run` without `--release`, so:
-
-- `release_max_level_info` (compile-time log filtering) was inert
-- all optimisations were disabled
-
-Release build, same code, same settings:
-
-| Build   | req/s      | p50         | p99         | DNS+dialup |
-| ------- | ---------- | ----------- | ----------- | ---------- |
-| debug   | 5,631      | 16.97 ms    | 39.12 ms    | 10.12 ms   |
-| release | **27,106** | **3.35 ms** | **9.78 ms** | 4.32 ms    |
-
-**4.8× throughput, 5× lower p50.**
-
-This invalidates the "~10k req/s environment ceiling" documented from
-Phase 1 onward — that was a debug-build ceiling, not a hardware one.
-The Phase 1 conclusion that the service was "entirely transport-bound"
-was reasoning from a number ~3× below actual capacity.
-
-Phase-over-phase comparisons remain valid (consistent profile), but all
-absolute figures before this point understate the service substantially.
-
-⚠️ The release build and the logging-config change landed together, so
-the 39% observability cost measured in debug is not yet confirmed for
-release. Re-measure by reverting the logging config on a release build.
-| Logs correlate across middleware + handler | ✅ conditional |
-
-Spans carry `request_id`, but the production filter
-(`release_max_level_info` + `on_response` at DEBUG) emits no per-request
-event on the success path — so there is nothing to print it on. Correlation
-is available on error paths, and on demand by building without
-`release_max_level_info`.
-
-This is a deliberate trade: per-request events cost ~20% throughput
-(measured). A redirect service needs correlation on failures, not successes.
-## Phase 4 — Background work & channels  ✅ M4: It's fast
-
-Env: GitHub Codespaces, 2 vCPU · Postgres + Redis co-located · **release build** · fresh database
-Hot read path `GET /:code`, oha 10s @ c=100, keepalive on
-Server in BENCH MODE (`RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1`)
-
-Each redirect now records a click. `CLICK_MODE` selects how:
-
-- `sync`: the redirect awaits `INSERT INTO clicks` before responding
-- `async` (default): the redirect calls `try_send` on a bounded `mpsc` channel; a background worker batches the inserts
-
-### Acceptance — redirect p99, async vs sync
-
-| Mode        | req/s  | p50      | p99           | p99.9     | DNS+dialup |
-| ----------- | ------ | -------- | ------------- | --------- | ---------- |
-| sync        | 1,532  | 56.82 ms | **191.80 ms** | 268.26 ms | 4.45 ms    |
-| async run A | 15,146 | 5.85 ms  | 18.99 ms      | 30.53 ms  | 4.10 ms    |
-| async run B | 15,979 | 5.65 ms  | **17.74 ms**  | 27.10 ms  | 5.74 ms    |
-
-**p99 improvement: 90.8%** (threshold ≥ 20%). **Throughput: 10.4×.**
-The two async runs agree to within ~5%, and every run had DNS+dialup below 7 ms (no host contention).
-
-### Why sync is slow
-
-Each redirect holds a pool connection until its INSERT commits, so 100 clients queue
-for 20 connections. Little's Law: 1,532 × 0.0654 s ≈ 100. The system is saturated, and
-requests spend most of their time waiting for a connection rather than running SQL.
-
-### Writer behaviour (async run B)
-
-| Metric                                         | Value   |
-| ---------------------------------------------- | ------- |
-| Clicks enqueued                                | 162,262 |
-| Batches                                        | 329     |
-| Avg rows per INSERT                            | 493.2   |
-| Failed batches                                 | 0       |
-| Queue depth after load                         | 0       |
-| Conservation gap (enqueued − written − queued) | 0       |
-
-Batching leaves Postgres doing about 33 INSERTs/s to persist about 16k clicks/s.
-
-### Click accounting
-
-2,000 redirects → **exactly 2,000 rows**, visible through `/stats` in 22–27 ms. 0 dropped.
-
-### Backpressure: drop on full
-
-| Run     | req/s  | Dropped      |
-| ------- | ------ | ------------ |
-| async A | 15,146 | 9,867 (6.5%) |
-| async B | 15,979 | 0 (0%)       |
-
-At ~15–16k req/s the writer runs close to the arrival rate, so whether the channel fills
-depends on timing. Report drops as a range: **0–6.5% at ~15–16k req/s**.
-
-Dropping is deliberate. `try_send` never waits, so a slow database can't slow a redirect,
-and the bounded channel caps memory use. The cost is an undercount; the alternative costs
-~10× in p99. Dropped clicks are counted, so the loss is visible.
-
-### Carried forward (still passing)
-
-| Probe                   | Result                                                      |
-| ----------------------- | ----------------------------------------------------------- |
-| 10,000 concurrent POSTs | 10,000 unique codes, 0 duplicates, 0 failures               |
-| Negative caching        | 500 repeat 404s → **0 DB queries**                          |
-| 404s record clicks      | **none** (stops scanners from filling the analytics table)  |
-| Single-flight           | 30 concurrent misses → **1 DB query**                       |
-| Request ID              | echoed · generated · distinct · present on 404 and `/stats` |
-| Hit ratio               | 99.98% → expected ~358 ns/lookup                            |
-
-### `GET /:code/stats` contract
-
-| Case                    | Result                        |
-| ----------------------- | ----------------------------- |
-| Existing, never clicked | `200 {"code":"…","clicks":0}` |
-| Unknown code            | `404` (not `clicks: 0`)       |
-| Malformed code          | `404`                         |
-| Reading `/stats`        | records no clicks             |
-| Content-Type            | `application/json`            |
-
-### Application-level (criterion, HTTP excluded)
-
-| Path                     | Phase 2   | Phase 4   | Verdict                          |
-| ------------------------ | --------- | --------- | -------------------------------- |
-| `InMemoryCache::get` hit | 219.38 ns | 265.25 ns | no significant change (p = 0.06) |
-| `find_by_code` (DB)      | 450.01 µs | 628.72 µs | no significant change (p = 0.27) |
-
-⚠️ `find_by_code` keeps rising from phase to phase. The likely cause is that `docker compose down`
-without `-v` keeps the volume, so `links` and `clicks` grow across runs.
-
-### ⚠️ Cost of analytics on the hot path
-
-| Config              | req/s  | p50     | p99      |
-| ------------------- | ------ | ------- | -------- |
-| Phase 3 (no clicks) | 27,106 | 3.35 ms | 9.78 ms  |
-| Phase 4 async       | 15,979 | 5.65 ms | 17.74 ms |
-
-Building a click on every redirect (a `String` allocation, SHA-256 of the IP, and `try_send`)
-costs **~41% throughput**. **Not yet measured.** The most likely main cost is SHA-256.
-Benchmark `hash_ip` before optimising.
-
-### Rate-limit bucket sweeper
-
-`workers/bucket_sweeper.rs` evicts idle buckets from the limiter's `DashMap`, using the same
-map as the middleware via `RateLimitState`. It is started from `AppState::build()`.
-
-Verified with `RATE_LIMIT_SWEEP_INTERVAL=2 RATE_LIMIT_IDLE_TTL=3`:
-
-    INFO linkforge::workers::bucket_sweeper: swept idle rate-limiting buckets, evicted: 1
-
-Evicting a bucket created by a real request shows the sweeper shares the limiter's map.
-Eviction long before the 300 s / 3600 s defaults could fire shows both overrides were read.
-
-### ⚠️ Methodology
-
-Both runs must meet all four of these, or the comparison is invalid:
-
-1. **Release build:** `cargo run --release`
-2. **Fresh database:** `docker compose down -v && docker compose up -d`
-3. **Bench-mode rate limit:** otherwise the limiter throttles the harness
-4. **Matching `CLICK_MODE`** on server and script (the script aborts on a mismatch)
+# LinkForge
+
+A rate-limited URL shortener in Rust, built phase by phase to learn backend
+systems engineering: concurrency, persistence, caching, middleware, background
+work, observability and deployment. Every phase ends with a measured result, and
+every claim below comes from a run in this repository.
+
+**Stack:** axum · tokio · tower · sqlx (Postgres) · tracing · metrics + Prometheus · Docker
+
+| | |
+|---|---|
+| **Throughput** | **13,415 req/s** on 2 shared vCPUs (container, load generator on the same host) |
+| **Server-side latency** | **p50 17 µs · p99 176 µs** (Prometheus `histogram_quantile`) |
+| **Async click pipeline** | redirect **p99 −88 to −91%** vs synchronous writes |
+| **Graceful shutdown** | SIGTERM under load: **112,273 redirects, 112,273 rows, 0 errors**, exit in 5.7 s |
+
+---
+
+## Contents
+
+- [LinkForge](#linkforge)
+  - [Contents](#contents)
+  - [Architecture](#architecture)
+  - [Quick start](#quick-start)
+  - [API](#api)
+  - [Configuration](#configuration)
+  - [Testing](#testing)
+  - [Progress](#progress)
+    - [Phase 1 — Core service, in-memory ✅](#phase-1--core-service-in-memory-)
+    - [Phase 2 — Persistence + cache coherence ✅](#phase-2--persistence--cache-coherence-)
+    - [Phase 3 — Middleware, rate limiting, observability ✅](#phase-3--middleware-rate-limiting-observability-)
+    - [Phase 4 — Background work and channels ✅](#phase-4--background-work-and-channels-)
+    - [Phase 5 — Production hardening ✅](#phase-5--production-hardening-)
+  - [Benchmark methodology](#benchmark-methodology)
+  - [What I learned](#what-i-learned)
+  - [Roadmap](#roadmap)
+    - [Known limitations](#known-limitations)
+
+---
+
+## Architecture
+
+```text
+                    ┌──────────────────────────────────────────────┐
+  HTTP client ────► │ axum Router                                  │
+                    │  ├─ /health/live, /health/ready  (no layers) │
+                    │  └─ tower stack:                             │
+                    │       request-id → trace → metrics →         │
+                    │       timeout → per-IP rate limit            │
+                    │                                              │
+                    │  POST /shorten   GET /{code}   GET /{code}/stats
+                    └───────┬───────────────────────┬──────────────┘
+                            │                       │ try_send (never awaits)
+                 ┌──────────▼──────────┐   ┌────────▼─────────┐
+                 │ read-through cache  │   │ bounded mpsc     │
+                 │ + negative cache    │   │ click events     │
+                 │ + single-flight     │   └────────┬─────────┘
+                 └──────────┬──────────┘            │ batches of ~490
+                 ┌──────────▼───────────────────────▼──────────┐
+                 │ Postgres (sqlx pool, statement timeout)      │
+                 └──────────────────────────────────────────────┘
+```
+
+Layering: `handlers → services → domain ← repositories → db`. Handlers never
+touch SQL, services never touch axum types, and `domain/` imports nothing from
+the project.
+
+---
+
+## Quick start
+
+**Prerequisites:** Docker, and for local development Rust (stable),
+[`just`](https://github.com/casey/just), `sqlx-cli` and [`oha`](https://github.com/hatoo/oha).
 
 ```bash
-CLICK_MODE=sync  RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 cargo run --release
-CLICK_MODE=sync  ./scripts/load_test.sh
+cp .env.example .env          # set POSTGRES_PASSWORD and ANALYTICS_IP_SALT
+docker compose up -d --build app
+curl localhost:3000/health/ready              # {"status":"ready"}
 
-CLICK_MODE=async RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 cargo run --release
-CLICK_MODE=async ./scripts/load_test.sh     # probe 10 prints the verdict
+curl -s -X POST localhost:3000/shorten \
+  -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+curl -i localhost:3000/<code>                 # 307 → https://example.com
+curl -s localhost:3000/<code>/stats           # {"code":"…","clicks":1}
+
+docker compose stop app                       # graceful: drains and flushes
 ```
 
-Raw results: `.loadtest/phase4_{sync,async}.env` and `.loadtest/phase4_{sync,async}_oha.txt`.
+Local development without the app container:
 
-`CLICK_MODE=sync` is kept as a supported mode: exact counts at ~10× lower throughput, and the
-regression baseline for later phases. The default is `async`.
-### Rate-limit bucket sweeper
-
-**Problem.** The Phase 3 rate limiter stores one token bucket per client IP in an
-in-process `DashMap<IpAddr, Bucket>`. Nothing ever removed entries, so the map grew by
-one entry (~60 B) for every distinct client, forever. A scanner rotating through IPv6
-addresses could grow it quickly.
-
-**Why Redis TTLs don't fix this.** Phase 6 moves the *link cache* to Redis behind the
-`Cache` trait. The limiter's map is a separate structure that stays in-process, so it
-needs its own cleanup. (Moving rate limiting into Redis was considered and rejected:
-it would add a network round trip to every request in exchange for multi-instance
-correctness this project doesn't need yet.)
-
-**Design.**
-
-| Concern | Location | Why |
-| --- | --- | --- |
-| Eviction rule | `RateLimitState::sweep(idle)` | `Bucket` fields are private to `rate_limit.rs` |
-| Timer loop | `workers/bucket_sweeper.rs` | background tasks live in `workers/`, next to the analytics writer |
-| Startup | `AppState::build()` | one place starts every background task; Phase 5 shutdown stops them there |
-| Shared map | `RateLimitLayer::from_state(state.rate_limiter.clone())` | the middleware and the sweeper must use the **same** `Arc<DashMap>` |
-
-`last_refill` doubles as a "last seen" timestamp, because it's updated on every
-request, including rejected ones. A bucket idle longer than `idle_ttl` is evicted:
-
-```rust
-pub fn sweep(&self, idle: Duration) -> usize {
-    let before = self.buckets.len();
-    self.buckets.retain(|_, b| b.last_refill.elapsed() < idle);
-    before - self.buckets.len()
-}
+```bash
+just up            # Postgres + Redis
+just run           # cargo run --release
+just test          # unit + integration tests
 ```
 
-**Rejected alternative: spawning inside `RateLimitState::from_config()`.** That
-would hide a side effect in a constructor, start one sweeper per router (and so one
-per test, never stopped), and leave Phase 5's graceful shutdown no single place to
-stop it.
+---
 
-**Configuration.**
+## API
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `RATE_LIMIT_SWEEP_INTERVAL` | 300 | seconds between sweeps |
-| `RATE_LIMIT_IDLE_TTL` | 3600 | seconds of inactivity before a bucket is evicted |
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/shorten` | `{"url": "..."}` → `{"code", "short_url"}`. Rejects non-HTTP(S) schemes and private/loopback targets |
+| `GET` | `/{code}` | `307` redirect; `404` for unknown or malformed codes |
+| `GET` | `/{code}/stats` | `{"code", "clicks"}`; `404` if the link doesn't exist |
+| `GET` | `/health/live` | liveness: `200` while the process runs |
+| `GET` | `/health/ready` | readiness: `200`, or `503` when draining or the DB is unreachable |
+| `GET` | `/metrics` | Prometheus exposition |
+| `GET` | `/debug/*` | cache and analytics internals — development only |
 
-⚠️ Invariant: `RATE_LIMIT_IDLE_TTL ≥ RATE_LIMIT_WINDOW_SECS`. If a bucket is evicted
-before its window ends, that client gets a fresh, full bucket on its next request,
-raising its effective rate limit.
+---
 
-**Cost.** `DashMap::retain` is synchronous and write-locks each shard in turn. At a
-300 s interval over thousands of entries this takes microseconds, but it briefly
-blocks requests touching the shard being swept. Keep this in mind before lowering the
-interval.
+## Configuration
 
-**Verification.** Run with `RATE_LIMIT_SWEEP_INTERVAL=2 RATE_LIMIT_IDLE_TTL=3`:
+Layered with [figment](https://docs.rs/figment); later layers override earlier ones:
 
-    INFO linkforge::workers::bucket_sweeper: swept idle rate-limiting buckets, evicted: 1
+```text
+configs/default.toml → configs/{APP_ENV}.toml → LINKFORGE__SECTION__KEY env vars
+```
 
-| Property | Evidence |
-| --- | --- |
-| Spawned and running | an entry was evicted |
-| Shares the limiter's map | it evicted a bucket created by a real request; a separate map would always be empty |
-| Interval override read | it swept long before the 300 s default could fire |
-| TTL override read | it evicted long before the 3600 s default could expire the bucket |
+Secrets come only from the environment: `DATABASE_URL`, `ANALYTICS_IP_SALT`,
+`JWT_SECRET`. Example override: `LINKFORGE__RATE_LIMIT__REQUESTS=500`.
 
-The sweeper logs only when it evicts something, so the timestamp shows when the bucket
-expired, not when the first sweep ran.
+`Settings::validate()` refuses to start on unsafe combinations, including:
+timeouts not ordered statement < acquire < request, a rate-limit bucket TTL
+shorter than its window, and — in production — a missing IP salt, debug routes
+enabled, or synchronous click writes.
 
-**Follow-ups.**
-- Rename to `RATE_LIMIT_SWEEP_INTERVAL_SECS` / `RATE_LIMIT_IDLE_TTL_SECS` to match `RATE_LIMIT_WINDOW_SECS`
-- Check `idle_ttl ≥ window_secs` at startup and fail fast if it doesn't hold
-- Log the interval and TTL when the sweeper starts
-- The test harness builds `RateLimitState` without a sweeper, so tests leave no background tasks running
+---
+
+## Testing
+
+| Layer | What it covers |
+|---|---|
+| Unit tests | domain invariants, base62, token bucket math, config validation (`figment::Jail`) |
+| Integration tests | real server + throwaway Postgres DB per test: redirects, cache coherence, restart survival, rate limiting, click accounting, health probes |
+| `scripts/load_test.sh` | throughput, correctness under concurrency, negative caching, single-flight, click conservation, sync vs async |
+| `scripts/behaviour_test.sh` | error contracts, response hygiene, SSRF inputs, cache churn, hostile clients, per-IP isolation |
+| `scripts/metrics_test.sh` | exposition validity, exact counters, histogram consistency, cardinality, real Prometheus scrape |
+| `scripts/container_test.sh` | image hygiene, end-to-end flow, SIGTERM under load, restart persistence, fail-fast config |
+
+Every probe asserts that it did real work: a test that passes for the wrong
+reason is treated as worse than one that fails.
+
+---
+
+## Progress
+
+| Phase | Concept | Milestone | Status |
+|---|---|---|---|
+| 0 | Bootstrap | — | ✅ |
+| 1 | Core service, in-memory | M1: It works | ✅ |
+| 2 | Persistence + cache coherence | M2: It remembers | ✅ |
+| 3 | Middleware, rate limiting, observability | M3: It's defensible | ✅ |
+| 4 | Background work and channels | M4: It's fast | ✅ |
+| 5 | Production hardening | M5: It ships | ✅ |
+| 6 | Redis cache | — | next |
+
+> Env for all numbers: GitHub Codespaces, 2 vCPU, Postgres co-located, `oha`
+> load generator on the same host, hot read path `GET /{code}` at c=100 unless noted.
+> Phases 1–3 were measured on a **debug build** (see Phase 3); compare those
+> only with each other.
+
+### Phase 1 — Core service, in-memory ✅
+
+Shorten → redirect over HTTP with `Arc<RwLock<HashMap>>`, base62 codes from an
+`AtomicU64`, and a typed `AppError` implementing `IntoResponse`.
+
+| c | req/s | p50 | p99 |
+|---|---|---|---|
+| 50 | 10,394 | 4.57 ms | 11.66 ms |
+| 100 | 9,763 | 9.82 ms | 23.04 ms |
+
+- 10,000 concurrent POSTs → 0 duplicate codes.
+- Cache lookup (criterion): 39.75 ns.
+- `DashMap` vs `RwLock<HashMap>` and 2 vs 10 worker threads made no measurable
+  difference at this load.
+
+### Phase 2 — Persistence + cache coherence ✅
+
+Postgres via sqlx with migrations, a read-through cache behind a `Cache` trait,
+negative caching for unknown codes, and single-flight to collapse concurrent misses.
+
+| Probe | Result |
+|---|---|
+| Hot read path @ c=100 | 9,783 req/s · p50 9.55 ms · p99 25.13 ms |
+| Negative caching | 501 requests for one unknown code → **1 DB query** |
+| Single-flight | 100 concurrent misses → **1 DB query** |
+| Restart | links resolve after the process restarts |
+
+Criterion: cache hit 219 ns vs DB lookup 450 µs — **a miss costs ~2,050× a hit**,
+which is the measured justification for the cache.
+
+### Phase 3 — Middleware, rate limiting, observability ✅
+
+Structured tracing with per-request spans, `x-request-id` propagation, and a
+hand-written `tower::Layer` token bucket per IP in a `DashMap`.
+
+- Exceeding the bucket returns `429` with `retry-after`.
+- Request IDs are echoed, generated when absent, and present on errors.
+
+**Regression isolated.** Throughput fell from 9,783 to 5,583 req/s. Removing
+pieces one at a time attributed it:
+
+| Config | req/s |
+|---|---|
+| Middleware removed, logging off | 9,090 |
+| Middleware on, log output off | 6,973 |
+| Full stack | 5,583 |
+
+Span construction cost about 23% and log emission about 20% more; the rate
+limiter cost nothing measurable. Compile-time log filtering
+(`release_max_level_info`) and a non-blocking writer were added in response.
+
+**Build-profile correction.** All benchmarks up to this point were debug builds.
+The same code built with `--release`:
+
+| Build | req/s | p50 | p99 |
+|---|---|---|---|
+| debug | 5,631 | 16.97 ms | 39.12 ms |
+| release | **27,106** | **3.35 ms** | **9.78 ms** |
+
+The "~10k req/s environment ceiling" from Phase 1 was a debug-build ceiling.
+All later numbers are release builds.
+
+### Phase 4 — Background work and channels ✅
+
+Every redirect records a click. In async mode the redirect calls `try_send` on a
+bounded channel and returns; a worker batches inserts. `click_mode = "sync"` is
+kept as a baseline that awaits the `INSERT` on every redirect.
+
+| Mode | req/s | p50 | p99 |
+|---|---|---|---|
+| sync | 1,532 | 56.82 ms | 191.80 ms |
+| async | **15,979** | **5.65 ms** | **17.74 ms** |
+
+**p99 −90.8%, throughput 10.4×** (reproduced across two runs). Sync is
+pool-bound: 100 clients queue for 20 connections (Little's Law: 1,532 × 0.065 s ≈ 100).
+
+- Writer: ~493 rows per `INSERT`, 0 failed batches, conservation gap 0.
+- 2,000 redirects → exactly 2,000 rows, visible via `/stats` in ~25 ms.
+- **Backpressure is drop-on-full**, by design: a slow database must not slow
+  redirects. Drops were 0–6.5% at ~15–16k req/s; one run with a 2.06 s
+  Postgres write stall dropped 20% while redirect latency stayed flat.
+- A sweeper evicts idle rate-limit buckets so the per-IP map can't grow forever.
+
+### Phase 5 — Production hardening ✅
+
+Graceful shutdown, liveness/readiness probes, Prometheus metrics, layered
+config with startup validation, request and DB statement timeouts, and a
+multi-stage distroless Docker image running as non-root.
+
+**Hot path in the container**
+
+| Run | req/s | p50 | p99 |
+|---|---|---|---|
+| Phase 4 async (host) | 15,979 | 5.65 ms | 17.74 ms |
+| Phase 5 async (container) | 13,415 | 6.31 ms | 22.93 ms |
+
+The −16% is not yet attributed: the move into a container, the metrics
+middleware and the timeout layer all landed together. Drops in the container
+were 14–15% across two runs.
+
+**Server-side vs client-side latency**
+
+| | p50 | p99 |
+|---|---|---|
+| Server (Prometheus `histogram_quantile`) | 17 µs | 176 µs |
+| Client (oha, c=100) | 6.31 ms | 22.93 ms |
+
+Over 99% of client-observed latency is outside the handler — TCP, scheduling and
+queueing on 2 vCPUs. Prometheus rate (13,330 req/s) agrees with oha (13,415 req/s).
+
+**Graceful shutdown under load**
+
+| Environment | Redirects | Rows in DB | Dropped | 5xx | Exit |
+|---|---|---|---|---|---|
+| Host | 105,780 | 105,780 | 0 | 0 | clean |
+| Host, 2.06 s DB stall | 76,733 | 60,991 | 15,742 | 0 | clean |
+| **Container** | **112,273** | **112,273** | **0** | **0** | **0 in 5.7 s** |
+
+Shutdown sequence: SIGTERM → readiness 503 (337 ms later) → delay → stop
+accepting → drain in-flight requests → click channel closes → writer flushes →
+sweeper stops → exit. Every accepted click reached Postgres.
+
+**Metrics:** exposition passes `promtool`; counters are exact (500 redirects →
++500 requests, latency samples, clicks and rows); 61 distinct paths created 0 new
+series because labels use route templates.
+
+---
+
+## Benchmark methodology
+
+A comparison is only valid if both runs meet all of these:
+
+1. **Release build.**
+2. **Fresh database** (`docker compose down -v`): write cost grows with table size.
+3. **Bench-mode rate limit** (`LINKFORGE__RATE_LIMIT__REQUESTS=100000000`): the
+   load generator is one IP and would otherwise measure the limiter.
+4. **DNS+dialup under ~7 ms** in the oha report: above that, the host was
+   contended and the run is discarded.
+5. **Nothing else on port 3000**, and the expected server confirmed in the logs.
+
+```bash
+just load-test async     # fresh DB, bench-mode container, full harness
+just metrics-test
+./scripts/container_test.sh
+```
+
+---
+
+## What I learned
+
+- **Measure, then attribute.** Two "regressions" disappeared on a rerun, and one
+  was entirely the debug build. Any number from a single run is a hypothesis.
+- **Check the probe, not just the result.** Several failures were instrumentation:
+  a counter read from the wrong field, a gauge set from two tasks, a test that
+  hit the domain validator instead of the cache, a container that never bound its
+  port while an old server answered every check.
+- **Backpressure is a product decision.** Dropping clicks keeps redirects fast;
+  blocking would turn a slow database into a slow service.
+- **Shutdown is an ordering problem.** Stop HTTP, then close the channel, then the
+  pool — each stage depends on the previous one having finished.
+- **Observability has a price.** Per-request spans and logs cost ~40% throughput
+  in debug builds; that cost is now measured and partly compiled out.
+
+---
+
+## Roadmap
+
+- **CI** — GitHub Actions: fmt, clippy, tests against a Postgres service,
+  `sqlx prepare --check`, Docker build.
+- **Open experiments** — attribute the −16% container drop (host run of the same
+  code) and the Phase 3 → 4 click-path cost (discard-sink writer).
+- **Phase 6** — Redis cache behind the existing `Cache` trait; measure a network
+  hop against the 17 µs server-side p50.
+- **Phase 7** — multi-tenant JWT / API-key auth as a tower layer.
+- **Phase 9** — idempotency keys on `POST /shorten`.
+- **Phase 10** — Grafana dashboards from the existing metrics.
+
+### Known limitations
+
+- Single instance: the in-process rate limiter and ID counter are per-process.
+- In this Codespace Docker's bridge DNS is broken, so the app container uses
+  `network_mode: host` and reaches Postgres at `localhost:5432`. On a normal
+  Docker host, use the bridge network and `postgres:5432`.

@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use reqwest::StatusCode;
 use tower::Service;
 
-use crate::config::RateLimitConfig;
+use crate::{config::RateLimitConfig, observability::metrics::RATE_LIMIT_REJECTIONS};
 
 ///The Bucket
 #[derive(Debug)]
@@ -119,7 +119,7 @@ where
             bucket.try_consume(self.state.capacity, self.state.refill_per_sec)
         };
         if !allowed {
-            metrics::counter!("linkforge_rate_limit_rejections_total").increment(1);
+            metrics::counter!(RATE_LIMIT_REJECTIONS).increment(1);
             tracing::warn!(%ip, "rate limit exceeded");
             let retry_after = self.state.refill_per_sec.recip().ceil() as u64;
             let resp = Response::builder()

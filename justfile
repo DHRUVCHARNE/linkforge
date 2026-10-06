@@ -54,40 +54,6 @@ check: fmt-check lint test
 clean:
     cargo clean
 
-# ─────────────────────────────── Docker ────────────────────────────
-
-# Start Postgres + Redis in the background
-up:
-    docker compose up -d
-
-# Stop containers (keeps data)
-stop:
-    docker compose stop
-
-# Stop and remove containers (data survives in the volume)
-down:
-    docker compose down
-
-# Stop, remove, AND wipe the data volume (fresh DB)
-down-hard:
-    docker compose down -v
-
-# List running containers
-ps:
-    docker compose ps
-
-# List ALL containers (including crashed/exited)
-ps-all:
-    docker compose ps -a
-
-# Follow Postgres logs live
-logs:
-    docker compose logs -f postgres
-
-# Open a psql shell inside the Postgres container
-psql:
-    docker compose exec postgres psql -U app_user -d linkforge
-
 # ─────────────────────────────── Database ──────────────────────────
 
 # Add a new migration:  just migrate-add create_links
@@ -106,29 +72,64 @@ migrate-revert:
 prepare:
     cargo sqlx prepare
 
-# ─────────────────────────────── Workflows ─────────────────────────
+# ─────────────────────────────── Docker ────────────────────────────
 
-# One-shot local bootstrap: start DB, wait for health, run migrations
-dev: up
-    @echo "Waiting for Postgres to become healthy..."
-    @until docker compose exec -T postgres pg_isready -U app_user -d linkforge > /dev/null 2>&1; do sleep 1; done
-    @just migrate
-    @echo "✅ Stack is up and migrated. Run 'just run' to start the app."
+# Start infrastructure only (Postgres + Redis). The app is started separately.
+up:
+    docker compose up -d postgres redis
 
+# Stop containers (keeps data)
+stop:
+    docker compose stop
 
-reset: 
-   just down
-   just up
+# Stop and remove containers (data survives in the volume)
+down:
+    docker compose down
 
-# Start the server in bench mode. Usage: just bench-server sync|async
+# Stop, remove, AND wipe the data volume (fresh DB)
+down-hard:
+    docker compose down -v
+
+# Fresh database + infrastructure
+reset:
+    docker compose down -v
+    docker compose up -d postgres redis
+
+# Run the app in a container with normal settings
+up-app:
+    docker compose up -d --build app
+
+# Follow app logs
+logs-app:
+    docker compose logs -f app
+
+# ─────────────────────────────── Benchmarks ────────────────────────
+
+# Host server in bench mode. Usage: just bench-server sync|async
 bench-server mode="async":
-    CLICK_MODE={{mode}} RATE_LIMIT_REQUESTS=100000000 RATE_LIMIT_WINDOW_SECS=1 \
-      cargo run --release
-
-# Run the load test against an already-running server. Usage: just load-test sync|async
-load-test mode="async":
-    just down 
-    just up
     LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
     LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 \
+    LINKFORGE__ANALYTICS__CLICK_MODE={{mode}} \
+    cargo run --release 2>&1 | tee /tmp/run.log
+
+# Load test against the CONTAINER in bench mode, on a fresh DB.
+# Usage: just load-test sync|async
+load-test mode="async": reset
+    LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
+    LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 \
+    LINKFORGE__ANALYTICS__CLICK_MODE={{mode}} \
+    docker compose up -d --build app
+    @echo "waiting for readiness..."
+    @until curl -sf localhost:3000/health/ready >/dev/null; do sleep 0.5; done
+    docker compose logs app | grep 'rate limiter configured'
     CLICK_MODE={{mode}} ./scripts/load_test.sh
+
+bench-app:
+    LINKFORGE__RATE_LIMIT__REQUESTS=100000000 \
+    LINKFORGE__RATE_LIMIT__WINDOW_SECS=1 \
+    docker compose up -d --build app
+    @until curl -sf localhost:3000/health/ready >/dev/null; do sleep 0.5; done
+    docker compose logs app | grep 'rate limiter configured'
+
+metrics-test: bench-app
+    ./scripts/metrics_test.sh

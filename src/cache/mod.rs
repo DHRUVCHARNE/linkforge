@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::domain::short_code::ShortCode;
+use crate::{domain::short_code::ShortCode, observability::metrics::CACHE_LOOKUPS};
 
 #[derive(Debug, Clone)]
 pub enum Cached {
@@ -86,7 +86,7 @@ impl Cache for InMemoryCache {
             Some(e) => e,
             None => {
                 metrics::counter!(
-                    "linkforge_cache_misses_total",
+                    CACHE_LOOKUPS,
                     "result"=>"miss"
                 )
                 .increment(1);
@@ -99,7 +99,7 @@ impl Cache for InMemoryCache {
         {
             self.map.remove(code);
             metrics::counter!(
-                "linkforge_cache_misses_total",
+                CACHE_LOOKUPS,
                 "result"=>"miss"
             )
             .increment(1);
@@ -109,7 +109,7 @@ impl Cache for InMemoryCache {
         Some(match &entry.value {
             Some(url) => {
                 metrics::counter!(
-                    "linkforge_cache_lookups_total",
+                    CACHE_LOOKUPS,
                     "result"=>"hit"
                 )
                 .increment(1);
@@ -118,7 +118,7 @@ impl Cache for InMemoryCache {
             }
             None => {
                 metrics::counter!(
-                    "linkforge_cache_lookups_total",
+                    CACHE_LOOKUPS,
                     "result"=>"negative_hit"
                 )
                 .increment(1);
