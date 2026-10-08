@@ -33,8 +33,6 @@ every claim below comes from a run in this repository.
     - [Phase 5 — Production hardening ✅](#phase-5--production-hardening-)
   - [Benchmark methodology](#benchmark-methodology)
   - [What I learned](#what-i-learned)
-  - [Roadmap](#roadmap)
-    - [Known limitations](#known-limitations)
 
 ---
 
@@ -153,7 +151,7 @@ reason is treated as worse than one that fails.
 | 3 | Middleware, rate limiting, observability | M3: It's defensible | ✅ |
 | 4 | Background work and channels | M4: It's fast | ✅ |
 | 5 | Production hardening | M5: It ships | ✅ |
-| 6 | Redis cache | — | next |
+
 
 > Env for all numbers: GitHub Codespaces, 2 vCPU, Postgres co-located, `oha`
 > load generator on the same host, hot read path `GET /{code}` at c=100 unless noted.
@@ -325,21 +323,3 @@ just metrics-test
 
 ---
 
-## Roadmap
-
-- **CI** — GitHub Actions: fmt, clippy, tests against a Postgres service,
-  `sqlx prepare --check`, Docker build.
-- **Open experiments** — attribute the −16% container drop (host run of the same
-  code) and the Phase 3 → 4 click-path cost (discard-sink writer).
-- **Phase 6** — Redis cache behind the existing `Cache` trait; measure a network
-  hop against the 17 µs server-side p50.
-- **Phase 7** — multi-tenant JWT / API-key auth as a tower layer.
-- **Phase 9** — idempotency keys on `POST /shorten`.
-- **Phase 10** — Grafana dashboards from the existing metrics.
-
-### Known limitations
-
-- Single instance: the in-process rate limiter and ID counter are per-process.
-- In this Codespace Docker's bridge DNS is broken, so the app container uses
-  `network_mode: host` and reaches Postgres at `localhost:5432`. On a normal
-  Docker host, use the bridge network and `postgres:5432`.

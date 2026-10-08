@@ -1,4 +1,3 @@
-pub mod redis_cache;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -28,8 +27,6 @@ pub trait Cache: Send + Sync {
     fn stats(&self) -> CacheStats;
 }
 
-//Phase 2 implementation: process-local, unbounded, no different impl
-//Phase 6 replaces this with redis cace and lua scripts -same trait different impl
 #[derive(Clone)]
 struct Entry {
     value: Option<Arc<str>>,     //None = known-missing
