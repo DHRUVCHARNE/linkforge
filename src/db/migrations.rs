@@ -4,6 +4,6 @@ use sqlx::postgres::PgPool;
 //is self contained - no migrations /directory needed at runtime
 
 pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
+          sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
 }

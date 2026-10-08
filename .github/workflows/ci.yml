@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    env:
+      SQLX_OFFLINE: "true"          # compile against committed .sqlx/, no DB needed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: tests (Postgres + Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app_user
+          POSTGRES_PASSWORD: app_password
+          POSTGRES_DB: linkforge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app_user -d linkforge"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://app_user:app_password@localhost:5432/linkforge
+      REDIS_URL: redis://localhost:6379
+      ANALYTICS_IP_SALT: ci-test-salt
+      APP_ENV: development
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true            # keeps sqlx-cli between runs
+      - name: Install sqlx-cli
+        run: |
+          command -v sqlx || cargo install sqlx-cli --locked \
+            --no-default-features --features postgres,rustls
+      - run: sqlx migrate run
+      - name: .sqlx/ is up to date
+        run: cargo sqlx prepare --check -- --all-targets
+      - name: Tests
+        run: cargo test --all-targets --locked
+
+  docker:
+    name: image build + smoke
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: linkforge-app:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test (compose stack)
+        run: |
+          docker compose up -d --wait postgres
+          docker compose up -d app
+          for i in $(seq 1 30); do
+            curl -fsS localhost:3000/health/ready && break; sleep 1
+          done
+          curl -fsS localhost:3000/health/ready
+          docker compose stop app                    # graceful path
+          docker compose ps -a app --format '{{.Status}}' | grep -q 'Exited (0)'
+      - if: failure()
+        run: docker compose logs app
